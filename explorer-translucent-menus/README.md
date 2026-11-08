@@ -13,21 +13,16 @@ ordinary controls, and other processes unchanged.
 ## Screenshots
 
 Materials in light and dark themes
-![materials](screenshots/01-materials-light-dark.png)
 
-<details>
-<summary>Tint and transparency adjustments</summary>
+![materials](https://raw.githubusercontent.com/alkali210/my-windhawk-mods/main/explorer-translucent-menus/screenshots/01-materials-light-dark.png)
 
-![tint](screenshots/02-tint-transparency.png)
+Tint and transparency adjustments
 
-</details>
+![tint](https://raw.githubusercontent.com/alkali210/my-windhawk-mods/main/explorer-translucent-menus/screenshots/02-tint-transparency.png)
 
-<details>
-<summary>Borders and submenus</summary>
+Borders and submenus
 
-![borders](screenshots/03-border-submenus.png)
-
-</details>
+![borders](https://raw.githubusercontent.com/alkali210/my-windhawk-mods/main/explorer-translucent-menus/screenshots/03-border-submenus.png)
 
 ## Requirements
 
@@ -36,8 +31,9 @@ Materials in light and dark themes
 - No other renderer modifying the same Explorer menus.
 
 To open a classic context menu on Windows 11, select **Show more options** or
-use **Shift+F10**. Select **Native** to disable all hooks, or hold **Ctrl** before
-opening a menu to bypass its modifications.
+use **Shift+F10**. Select **Native** to disable all hooks. For a temporary bypass,
+enable **Hold Ctrl to bypass** in the settings, then hold **Ctrl** before opening
+a menu.
 
 ## Materials
 
@@ -66,12 +62,19 @@ while the modified menu is being tracked.
 Legacy icon repair converts copied RGB bitmaps to premultiplied alpha. Optional
 background removal clears only matching corner-connected white, black, or
 magenta regions. Disable background removal for icons with intentional borders.
+Transfers that declare per-pixel alpha, and bitmaps with ambiguous partial
+alpha, retain the original GDI behavior. The mod does not guess whether an
+existing alpha bitmap is straight or premultiplied.
 
 ## Scope and rendering approach
 
 This mod keeps the Shell's immersive owner-draw enabled and preserves native
 menu layout, commands, and shell extensions. Effects are scoped to supported
-classic popups while a menu is tracked, with per-menu state restored afterward.
+classic popups while a menu is tracked. Preparation validates resources before
+applying effects and exposes the popup to drawing hooks only after commit.
+Only successful state changes are recorded for cleanup. Unassociated memory
+DCs are left to Windows; owner-draw memory DCs require an exact synchronous
+WM_DRAWITEM match.
 GDI and UxTheme hooks are installed in Explorer, but forward to Windows outside
 a tracked menu. The scope is the popup effect, rather than a replacement for
 Explorer's overall interface rendering.
@@ -117,6 +120,15 @@ Unknown owner-drawn menus, custom background brushes, high contrast, remote
 sessions, disabled transparency, and recognized conflicting renderers are
 left unchanged. Settings changes reload the mod. Active effects suppress the
 native bitmap opening animation to avoid an opaque initial snapshot.
+
+Menus whose previous system-backdrop value cannot be read stay native. Unreadable
+optional dark-mode and corner preferences are left unchanged. Recorded values
+are restored on live-window cleanup; failed restores remain pending for retry.
+There are no public getters for prior blur regions or extended-frame margins,
+and the Accent getter is unavailable on some builds. Cleanup of those states is
+best-effort, not a lossless restoration guarantee for an unknown renderer. A
+missing border-color snapshot likewise uses the Windows default on cleanup.
+Destroyed popup HWNDs release their window-owned effects without extra resets.
 
 The implementation uses version-dependent Windows interfaces: the composition
 attribute exports, UxTheme ordinal 74, the DarkMode::Menu theme, menu layout
