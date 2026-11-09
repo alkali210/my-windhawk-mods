@@ -1281,6 +1281,7 @@ struct MenuScope {
     HHOOK messageHook = nullptr;
     bool ownerSubclass = false;
     HWND owner = nullptr;
+    HMENU rootMenu = nullptr;
     Popup popups[32]{};
     unsigned count = 0;
     HWND paintingWindow = nullptr;
@@ -1293,8 +1294,8 @@ struct MenuScope {
     DWORD commandStyle = 0;
     SelectionReplay* commandReplay = nullptr;
 
-    explicit MenuScope(HWND menuOwner, bool requestEffects)
-        : previous(t_scope), owner(menuOwner) {
+    explicit MenuScope(HMENU menu, HWND menuOwner, bool requestEffects)
+        : previous(t_scope), owner(menuOwner), rootMenu(menu) {
         // Even a bypassed nested call must hide the outer call's drawing scope.
         t_scope = this;
         AcquireSRWLockExclusive(&g_scopesLock);
@@ -1740,6 +1741,15 @@ bool HandleMenuClick(MenuScope& scope, Popup& popup, WPARAM position) {
         (item.fType & MFT_SEPARATOR) ||
         (item.fState & (MFS_DISABLED | MFS_GRAYED)))
         return false;
+    if (scope.rootMenu != popup.menu) {
+        MENUINFO rootInfo{sizeof(rootInfo)};
+        rootInfo.fMask = MIM_STYLE;
+        if (!GetMenuInfo(scope.rootMenu, &rootInfo))
+            return false;
+        // The tracked root's position-notification style also governs commands
+        // selected from submenus that do not carry the style themselves.
+        info.dwStyle |= rootInfo.dwStyle & MNS_NOTIFYBYPOS;
+    }
 
     if (!popup.clickReplay || popup.replayPosition != position)
         CaptureMenuClick(scope, popup, position);
@@ -2589,7 +2599,7 @@ DrawTextHook(HDC dc, PCWSTR text, int length, RECT* rect, UINT flags) {
 }
 
 template <typename Invoke>
-BOOL TrackMenu(HWND owner, UINT flags, Invoke invoke) {
+BOOL TrackMenu(HMENU menu, HWND owner, UINT flags, Invoke invoke) {
     CallGuard call;
     DWORD incomingError = GetLastError();
     PCWSTR reason = L"nested bypass";
@@ -2598,7 +2608,7 @@ BOOL TrackMenu(HWND owner, UINT flags, Invoke invoke) {
     BOOL result;
     DWORD resultError;
     {
-        MenuScope scope(owner, requestEffects);
+        MenuScope scope(menu, owner, requestEffects);
         // BufferedPaint must be initialized on each rendering thread. Pending
         // callbacks remain inert so initialization cannot modify a popup.
         if (scope.Ready()) {
@@ -2633,7 +2643,13 @@ BOOL TrackMenu(HWND owner, UINT flags, Invoke invoke) {
                 ETM_LOG(L"Click owner=%p command=%u mode=%u replay=%d", owner,
                         scope.commandId,
                         static_cast<unsigned>(g_settings.selectionFade), started);
-                result = flags & TPM_RETURNCMD ? scope.commandId : TRUE;
+                // Position-based menus do not return a command ID, even with
+                // TPM_RETURNCMD; that flag still suppresses notifications.
+                result = flags & TPM_RETURNCMD
+                             ? (scope.commandStyle & MNS_NOTIFYBYPOS
+                                    ? 0
+                                    : scope.commandId)
+                             : TRUE;
                 if (!(flags & (TPM_RETURNCMD | TPM_NONOTIFY))) {
                     if (scope.commandStyle & MNS_NOTIFYBYPOS)
                         PostMessageW(owner, WM_MENUCOMMAND,
@@ -2676,7 +2692,7 @@ BOOL WINAPI TrackPopupMenuHook(HMENU menu,
                                int reserved,
                                HWND owner,
                                const RECT* exclude) {
-    return TrackMenu(owner, flags, [&](UINT actualFlags) {
+    return TrackMenu(menu, owner, flags, [&](UINT actualFlags) {
         return g_trackPopupMenu(menu, actualFlags, x, y, reserved, owner,
                                 exclude);
     });
@@ -2688,7 +2704,7 @@ BOOL WINAPI TrackPopupMenuExHook(HMENU menu,
                                  int y,
                                  HWND owner,
                                  LPTPMPARAMS params) {
-    return TrackMenu(owner, flags, [&](UINT actualFlags) {
+    return TrackMenu(menu, owner, flags, [&](UINT actualFlags) {
         return g_trackPopupMenuEx(menu, actualFlags, x, y, owner, params);
     });
 }

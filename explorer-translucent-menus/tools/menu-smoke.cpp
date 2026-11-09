@@ -399,6 +399,7 @@ unsigned selectionCaseNumber = 0;
 unsigned selectionLastCase = ~0u;
 
 enum class FadeAction { Root, Child, Cancel, Disabled, Submenu };
+enum class PositionStyle { None, RootOnly, Both };
 struct FadeFixture {
     bool running = false, mouse = false, sent = false;
     bool modified = false, childSeen = false, disabledStayedOpen = false;
@@ -623,7 +624,7 @@ void FadeTimer(HWND owner) {
 
 void RunSelectionCase(HWND owner, etm::SelectionFade choice, bool legacy,
                       bool mouse, FadeAction action, bool unload = false,
-                      UINT flags = TPM_RETURNCMD, bool byPosition = false) {
+                      UINT flags = TPM_RETURNCMD, PositionStyle positionStyle = PositionStyle::None) {
     if (selectionCaseNumber > selectionLastCase) return;
     ++selectionCaseNumber;
     fade = {};
@@ -639,19 +640,21 @@ void RunSelectionCase(HWND owner, etm::SelectionFade choice, bool legacy,
     AppendMenuW(fade.menu, MF_STRING, 44, L"&Root command");
     AppendMenuW(fade.menu, MF_STRING | MF_DISABLED, 45, L"&Disabled command");
     AppendMenuW(fade.menu, MF_POPUP, reinterpret_cast<UINT_PTR>(fade.child), L"&Submenu");
+    bool byPosition = positionStyle != PositionStyle::None;
     if (byPosition) {
         MENUINFO info{sizeof(info)};
         info.fMask = MIM_STYLE;
         info.dwStyle = MNS_NOTIFYBYPOS;
-        Check(SetMenuInfo(fade.menu, &info) && SetMenuInfo(fade.child, &info),
-              "native position-based notification style applied");
+        Check(SetMenuInfo(fade.menu, &info) &&
+              (positionStyle != PositionStyle::Both || SetMenuInfo(fade.child, &info)),
+              "position-based notification style applied to the requested menus");
     }
     etm::g_settings.selectionFade = choice;
-    printf("Selection fade: case=%u choice=%u api=%s input=%s action=%u flags=%#x bypos=%d%s\n",
+    printf("Selection fade: case=%u choice=%u api=%s input=%s action=%u flags=%#x positionStyle=%u%s\n",
         selectionCaseNumber - 1, static_cast<unsigned>(choice),
         legacy ? "TrackPopupMenu" : "TrackPopupMenuEx",
         mouse ? "mouse" : "keyboard", static_cast<unsigned>(action), flags,
-        byPosition, unload ? " unload" : "");
+        static_cast<unsigned>(positionStyle), unload ? " unload" : "");
     SetForegroundWindow(owner);
     fade.started = GetTickCount64();
     SetTimer(owner, 2, 60, nullptr);
@@ -662,7 +665,8 @@ void RunSelectionCase(HWND owner, etm::SelectionFade choice, bool legacy,
     Check(fade.modified, "real native loop uses an active modified popup");
     bool command = action == FadeAction::Root || action == FadeAction::Child;
     UINT expectedCommand = action == FadeAction::Child ? 42 : 44;
-    Check(flags & TPM_RETURNCMD ? static_cast<UINT>(result) == (command ? expectedCommand : 0u) :
+    Check(flags & TPM_RETURNCMD ?
+          static_cast<UINT>(result) == (command && !byPosition ? expectedCommand : 0u) :
           (result != FALSE) == command, "native return value preserves return-command and notification contracts");
     if (action == FadeAction::Child || action == FadeAction::Submenu)
         Check(fade.childSeen, "native child popup opens before child activation or cancellation");
@@ -769,6 +773,16 @@ void CheckSelectionFade(HWND owner) {
     DWORD gdi = GetGuiResources(GetCurrentProcess(), GR_GDIOBJECTS);
     DWORD handles = 0;
     GetProcessHandleCount(GetCurrentProcess(), &handles);
+    // Root-only styles govern child clicks too. A successful click still
+    // returns zero with TPM_RETURNCMD when position notifications are enabled.
+    for (auto choice : {etm::SelectionFade::Instant, etm::SelectionFade::Replay})
+        for (bool legacy : {false, true})
+            for (auto action : {FadeAction::Root, FadeAction::Child})
+                for (UINT flags : {0u, static_cast<UINT>(TPM_RETURNCMD)})
+                    RunSelectionCase(owner, choice, legacy, true, action, false,
+                                     flags, PositionStyle::RootOnly);
+    RunSelectionCase(owner, etm::SelectionFade::Replay, false, true, FadeAction::Child,
+                     false, TPM_RETURNCMD | TPM_NONOTIFY, PositionStyle::Both);
     for (auto choice : {etm::SelectionFade::Native, etm::SelectionFade::Instant, etm::SelectionFade::Replay})
         for (bool legacy : {false, true}) {
             RunSelectionCase(owner, choice, legacy, true, FadeAction::Root);
@@ -784,7 +798,7 @@ void CheckSelectionFade(HWND owner) {
         for (bool legacy : {false, true}) {
             RunSelectionCase(owner, choice, legacy, true, FadeAction::Root, false, 0);
             RunSelectionCase(owner, choice, legacy, true, FadeAction::Child, false, TPM_NONOTIFY);
-            RunSelectionCase(owner, choice, legacy, true, FadeAction::Child, false, 0, true);
+            RunSelectionCase(owner, choice, legacy, true, FadeAction::Child, false, 0, PositionStyle::Both);
             RunSelectionCase(owner, choice, legacy, true, FadeAction::Root, false, TPM_RETURNCMD | TPM_NONOTIFY);
         }
     RunSelectionCase(owner, etm::SelectionFade::Replay, false, true, FadeAction::Root, true);
