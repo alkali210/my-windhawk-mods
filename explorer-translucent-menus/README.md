@@ -118,8 +118,8 @@ popup menus and leaves the main window backdrop to ExplorerBlurMica.
 
 Unknown owner-drawn menus, custom background brushes, high contrast, remote
 sessions, disabled transparency, and recognized conflicting renderers are
-left unchanged. Settings changes reload the mod. Active effects suppress the
-native bitmap opening animation to avoid an opaque initial snapshot.
+left unchanged. Settings changes reload the mod. Menu opening animations follow
+the Windows settings and the caller's flags, including when effects are active.
 
 Menus whose previous system-backdrop value cannot be read stay native. Unreadable
 optional dark-mode and corner preferences are left unchanged. Recorded values
