@@ -1,4 +1,4 @@
-"""Build with the installed Windhawk compiler; writes only to this workspace."""
+"""Build locally; --run-tests --test-mode selection-fade exercises native dismissal."""
 from pathlib import Path
 import argparse
 import os
@@ -10,6 +10,8 @@ parser = argparse.ArgumentParser()
 parser.add_argument('--windhawk', type=Path, default=Path(os.environ.get('ProgramW6432', r'C:\Program Files')) / 'Windhawk')
 parser.add_argument('--tests', action='store_true')
 parser.add_argument('--run-tests', action='store_true')
+parser.add_argument('--test-mode', choices=['smoke', 'selection-fade'], default='smoke',
+                    help='Native menu harness mode used by --run-tests (requires an interactive desktop)')
 parser.add_argument('--runtime-dir', type=Path, default=Path(os.environ.get('ProgramData', r'C:\ProgramData')) / 'Windhawk/Engine/Mods/64')
 args = parser.parse_args()
 compiler = args.windhawk / 'Compiler/bin/clang++.exe'
@@ -63,9 +65,13 @@ if args.tests or args.run_tests:
 if args.run_tests:
     env = os.environ.copy()
     env['PATH'] = str(args.runtime_dir) + os.pathsep + env.get('PATH', '')
-    result = subprocess.run([str(output / 'menu-smoke.exe')], cwd=ROOT, env=env,
-                            capture_output=True, text=True, errors='replace', timeout=60)
+    command = [str(output / 'menu-smoke.exe')]
+    if args.test_mode == 'selection-fade':
+        command.append('--selection-fade')
+    result = subprocess.run(command, cwd=ROOT, env=env, capture_output=True,
+                            text=True, errors='replace',
+                            timeout=180 if args.test_mode == 'selection-fade' else 60)
     log = result.stdout + result.stderr
-    (output / 'smoke-test.log').write_text(log, encoding='utf-8')
+    (output / f'{args.test_mode}-test.log').write_text(log, encoding='utf-8')
     print(log)
     result.check_returncode()

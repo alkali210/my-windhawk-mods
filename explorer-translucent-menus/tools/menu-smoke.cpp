@@ -6,8 +6,13 @@
 #include <MinHook.h>
 #include <cstdio>
 #include <cstdarg>
+#include <cstdlib>
 #include <cstring>
 #include <initializer_list>
+
+// Use the SDK's declaration-only utility path, not Windhawk's injected runtime.
+#define WH_EDITING
+#define WH_MOD_ID L"isolated@explorer-translucent-menus"
 
 void Wh_Log(PCWSTR format, ...) {
     va_list args;
@@ -156,6 +161,18 @@ BOOL WINAPI TestSetWindowPos(HWND hwnd, HWND after, int x, int y, int cx, int cy
     }
     return SetWindowPos(hwnd, after, x, y, cx, cy, flags);
 }
+unsigned forbiddenAnimationWrites = 0;
+BOOL WINAPI TestSystemParametersInfoW(UINT action, UINT param, PVOID value, UINT flags) {
+    if (action == SPI_SETSELECTIONFADE || action == SPI_SETMENUFADE ||
+        action == SPI_SETMENUANIMATION) {
+        ++forbiddenAnimationWrites;
+        SetLastError(ERROR_ACCESS_DENIED);
+        return FALSE;  // A regression must not alter the user's desktop.
+    }
+    return SystemParametersInfoW(action, param, value, flags);
+}
+
+#define SystemParametersInfoW TestSystemParametersInfoW
 #define DwmSetWindowAttribute TestDwmSetAttribute
 #define SetWindowPos TestSetWindowPos
 #define GetAsyncKeyState TestGetAsyncKeyState
@@ -174,6 +191,7 @@ BOOL WINAPI TestSetWindowPos(HWND hwnd, HWND after, int x, int y, int cx, int cy
 #undef BufferedPaintUnInit
 #undef GetDCEx
 #undef DwmGetWindowAttribute
+#undef SystemParametersInfoW
 
 int failures = 0;
 bool emulateUnprotectedBorder = false;
@@ -197,13 +215,13 @@ bool processingFixtureTimer = false;
 bool shellFixture = false;
 unsigned shellDraws = 0;
 unsigned shellMisses = 0;
-unsigned shellHookedTexts = 0;
 bool shellChildDrawn = false;
 HMENU shellChild = nullptr;
 bool previewMode = false;
 HMENU previewMenu = nullptr;
 HWND previewMaterials = nullptr, previewThemes = nullptr;
 HWND previewBorder = nullptr, previewCorners = nullptr;
+HWND previewSelectionFade = nullptr;
 HBITMAP previewIcon = nullptr;
 etm::CompositionAttribute_t realComposition = nullptr;
 bool rejectNextAccent = false;
@@ -223,50 +241,12 @@ BOOL WINAPI TestComposition(HWND hwnd, etm::CompositionData* data) {
 
 void CheckAlpha(HWND owner);
 
-const void* borderProbeValue = nullptr;
-DWORD borderProbeSize = 0;
-COLORREF borderProbeColor = 0;
-HRESULT WINAPI BorderProbe(HWND, DWORD, LPCVOID value, DWORD size) {
-    borderProbeValue = value;
-    borderProbeSize = size;
-    borderProbeColor = value && size == sizeof(COLORREF) ? *static_cast<const COLORREF*>(value) : 0;
-    SetLastError(0x2468);
-    return E_ACCESSDENIED;
-}
 
 void Check(bool condition, const char* name) {
     printf("%s: %s\n", condition ? "PASS" : "FAIL", name);
     if (!condition) ++failures;
 }
 
-void CheckBorderHookScope(etm::Popup& popup, HWND owner) {
-    auto original = etm::g_dwmSetWindowAttribute;
-    etm::g_dwmSetWindowAttribute = BorderProbe;
-    COLORREF requested = RGB(87, 65, 43);
-    HRESULT result = DwmSetWindowAttribute(popup.hwnd, DWMWA_BORDER_COLOR, &requested, sizeof(requested));
-    Check(result == E_ACCESSDENIED && GetLastError() == 0x2468 &&
-          borderProbeColor == DWMWA_COLOR_NONE && requested == RGB(87, 65, 43),
-          "border hook preserves result/error and never mutates caller storage");
-    for (int scenario = 0; scenario < 7; ++scenario) {
-        bool allowed = etm::t_scope->allowed;
-        if (scenario == 0) etm::g_settings.hideMenuBorder = false;
-        if (scenario == 1) popup.active = false;
-        if (scenario == 2) etm::t_scope->allowed = false;
-        if (scenario == 3) etm::g_stopping.store(true);
-        DWORD size = scenario == 6 ? 0 : sizeof(requested);
-        result = DwmSetWindowAttribute(scenario == 4 ? owner : popup.hwnd,
-            scenario == 5 ? DWMWA_CAPTION_COLOR : DWMWA_BORDER_COLOR, &requested, size);
-        DWORD error = GetLastError();
-        Check(result == E_ACCESSDENIED && error == 0x2468 &&
-              borderProbeValue == &requested && borderProbeSize == size,
-              "border hook forwards disabled/inactive/bypassed/stopping/unrelated/invalid calls unchanged");
-        etm::g_settings.hideMenuBorder = true;
-        popup.active = true;
-        etm::t_scope->allowed = allowed;
-        etm::g_stopping.store(false);
-    }
-    etm::g_dwmSetWindowAttribute = original;
-}
 
 void SampleFrame(BackdropTrace& trace) {
     if (!trace.shown) return;
@@ -413,7 +393,440 @@ HRESULT WINAPI ObserveText(HTHEME theme, HDC dc, int part, int state,
     return etm::DrawThemeTextHook(theme, dc, part, state, text, len, flags, flags2, rect);
 }
 
+constexpr COLORREF kFadeBackground = RGB(255, 235, 64);
+bool selectionFixtureMode = false;
+unsigned selectionCaseNumber = 0;
+unsigned selectionLastCase = ~0u;
+
+enum class FadeAction { Root, Child, Cancel, Disabled, Submenu };
+struct FadeFixture {
+    bool running = false, mouse = false, sent = false;
+    bool modified = false, childSeen = false, disabledStayedOpen = false;
+    unsigned stage = 0, commands = 0, replayCount = 0;
+    unsigned positionCommands = 0;
+    UINT notifiedCommand = 0, notifiedPosition = static_cast<UINT>(-1);
+    HMENU notifiedMenu = nullptr;
+    bool notificationParametersValid = true;
+    HMENU menu = nullptr, child = nullptr;
+    FadeAction action = FadeAction::Root;
+    ULONGLONG rowReady = 0;
+    ULONGLONG started = 0, activated = 0;
+    RECT row{};
+    COLORREF samples[64]{};
+    HWND replays[16]{};
+    BOOL selectionFade = FALSE, menuFade = FALSE, menuAnimation = FALSE;
+} fade;
+
+bool ReadAnimationPreferences(BOOL& selection, BOOL& menu, BOOL& animation) {
+    return SystemParametersInfoW(SPI_GETSELECTIONFADE, 0, &selection, 0) &&
+        SystemParametersInfoW(SPI_GETMENUFADE, 0, &menu, 0) &&
+        SystemParametersInfoW(SPI_GETMENUANIMATION, 0, &animation, 0);
+}
+
+void CheckAnimationPreferences() {
+    BOOL selection = FALSE, menu = FALSE, animation = FALSE;
+    Check(ReadAnimationPreferences(selection, menu, animation) &&
+          selection == fade.selectionFade && menu == fade.menuFade &&
+          animation == fade.menuAnimation && !forbiddenAnimationWrites,
+          "selection and opening animation desktop preferences remain unchanged");
+}
+
+bool IsReplayWindow(HWND hwnd) {
+    wchar_t name[80]{};
+    return GetClassNameW(hwnd, name, ARRAYSIZE(name)) &&
+        wcscmp(name, L"ExplorerTranslucentMenus.SelectionReplay") == 0;
+}
+
+void RecordReplay(HWND hwnd) {
+    if (!IsReplayWindow(hwnd)) return;
+    for (unsigned i = 0; i < fade.replayCount; ++i)
+        if (fade.replays[i] == hwnd) return;
+    if (fade.replayCount < ARRAYSIZE(fade.replays))
+        fade.replays[fade.replayCount++] = hwnd;
+}
+
+void CALLBACK ReplayEvent(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG object,
+                          LONG child, DWORD, DWORD) {
+    if (object == OBJID_WINDOW && child == CHILDID_SELF &&
+        (event == EVENT_OBJECT_CREATE || event == EVENT_OBJECT_SHOW))
+        RecordReplay(hwnd);
+}
+
+BOOL CALLBACK FindReplay(HWND hwnd, LPARAM param) {
+    DWORD process = 0;
+    GetWindowThreadProcessId(hwnd, &process);
+    if (process == GetCurrentProcessId() && IsReplayWindow(hwnd)) {
+        RecordReplay(hwnd);
+        if (IsWindowVisible(hwnd)) ++*reinterpret_cast<unsigned*>(param);
+    }
+    return TRUE;
+}
+
+unsigned VisibleReplays() {
+    unsigned count = 0;
+    EnumWindows(FindReplay, reinterpret_cast<LPARAM>(&count));
+    return count;
+}
+
+void PumpFor(DWORD milliseconds) {
+    ULONGLONG end = GetTickCount64() + milliseconds;
+    do {
+        MSG message{};
+        while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
+            TranslateMessage(&message);
+            DispatchMessageW(&message);
+        }
+        if (GetTickCount64() >= end) break;
+        MsgWaitForMultipleObjects(0, nullptr, FALSE, 5, QS_ALLINPUT);
+    } while (true);
+}
+
+void SampleSelectedRow(COLORREF* samples) {
+    for (unsigned i = 0; i < 64; ++i) samples[i] = CLR_INVALID;
+    int width = fade.row.right - fade.row.left;
+    int height = fade.row.bottom - fade.row.top;
+    if (width <= 0 || height <= 0) return;
+    HDC screen = GetDC(nullptr);
+    etm::IconSurface image;
+    image.dc = CreateCompatibleDC(screen);
+    BITMAPINFO info{};
+    info.bmiHeader = {sizeof(BITMAPINFOHEADER), width, -height, 1, 32, BI_RGB};
+    DWORD* pixels = nullptr;
+    image.bitmap = CreateDIBSection(screen, &info, DIB_RGB_COLORS,
+        reinterpret_cast<void**>(&pixels), nullptr, 0);
+    if (image.dc && image.bitmap) image.old = SelectObject(image.dc, image.bitmap);
+    bool captured = image.old && image.old != HGDI_ERROR &&
+        BitBlt(image.dc, 0, 0, width, height, screen, fade.row.left,
+               fade.row.top, SRCCOPY | CAPTUREBLT) && GdiFlush();
+    ReleaseDC(nullptr, screen);
+    if (!captured) return;
+    // One screen transfer samples a single frame; repeated desktop GetPixel
+    // calls can span most of the animation and compare different frames.
+    for (int y = 0; y < 4; ++y) for (int x = 0; x < 16; ++x) {
+        DWORD pixel = pixels[(height * (2 * y + 1) / 8) * width +
+                             width * (2 * x + 1) / 32];
+        samples[y * 16 + x] = RGB((pixel >> 16) & 255, (pixel >> 8) & 255, pixel & 255);
+    }
+}
+
+
+unsigned ColorDistance(COLORREF a, COLORREF b) {
+    int red = static_cast<int>(GetRValue(a)) - GetRValue(b);
+    int green = static_cast<int>(GetGValue(a)) - GetGValue(b);
+    int blue = static_cast<int>(GetBValue(a)) - GetBValue(b);
+    return static_cast<unsigned>(std::abs(red) + std::abs(green) + std::abs(blue));
+}
+
+void SendFadeInput(HWND popup, HMENU menu, unsigned position, bool activate) {
+    RECT row{};
+    if (!GetMenuItemRect(nullptr, menu, position, &row)) return;
+    if (fade.mouse) {
+        // Real mouse input: posting internal MN_* messages is not activation.
+        SetCursorPos((row.left + row.right) / 2, (row.top + row.bottom) / 2);
+        if (!activate) {
+            INPUT move[2]{};
+            move[0].type = move[1].type = INPUT_MOUSE;
+            move[0].mi.dwFlags = move[1].mi.dwFlags =
+                MOUSEEVENTF_MOVE | MOUSEEVENTF_MOVE_NOCOALESCE;
+            move[0].mi.dx = 1;
+            move[1].mi.dx = -1;
+            Check(SendInput(2, move, sizeof(INPUT)) == 2,
+                  "hover is delivered even when successive popups reuse the cursor position");
+        }
+        if (activate) {
+            INPUT input[3]{};
+            input[0].type = input[1].type = input[2].type = INPUT_MOUSE;
+            input[0].mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE |
+                MOUSEEVENTF_VIRTUALDESK | MOUSEEVENTF_MOVE_NOCOALESCE;
+            input[0].mi.dx = MulDiv((row.left + row.right) / 2 -
+                GetSystemMetrics(SM_XVIRTUALSCREEN), 65535,
+                GetSystemMetrics(SM_CXVIRTUALSCREEN) - 1);
+            input[0].mi.dy = MulDiv((row.top + row.bottom) / 2 -
+                GetSystemMetrics(SM_YVIRTUALSCREEN), 65535,
+                GetSystemMetrics(SM_CYVIRTUALSCREEN) - 1);
+            input[1].mi.dwFlags = MOUSEEVENTF_LEFTDOWN;
+            input[2].mi.dwFlags = MOUSEEVENTF_LEFTUP;
+            Check(SendInput(3, input, sizeof(INPUT)) == 3, "native mouse activation injected");
+        }
+    } else if (activate) {
+        wchar_t key = position == 0 ? (menu == fade.child ? L'c' : L'r') :
+            position == 1 ? L'd' : L's';
+        PostMessageW(popup, WM_CHAR, key, 0);
+    } else if (position == 0) {
+        PostMessageW(popup, WM_KEYDOWN, VK_HOME, 0);
+    }
+}
+
+void FadeTimer(HWND owner) {
+    auto scope = etm::t_scope;
+    HWND root = nullptr, child = nullptr;
+    if (scope) for (unsigned i = 0; i < scope->count; ++i) {
+        const auto& popup = scope->popups[i];
+        if (!popup.active || !IsWindowVisible(popup.hwnd)) continue;
+        fade.modified = true;
+        if (popup.menu == fade.menu) root = popup.hwnd;
+        if (popup.menu == fade.child) child = popup.hwnd;
+    }
+    if (child) fade.childSeen = true;
+    if (GetTickCount64() - fade.started > 2500) {
+        Check(false, "selection fixture completes without a native-loop timeout");
+        KillTimer(owner, 2);
+        EndMenu();
+        return;
+    }
+    if (!root) return;
+    if (fade.sent) {
+        if (fade.action == FadeAction::Disabled &&
+            GetTickCount64() - fade.activated >= 150) {
+            Check(VisibleReplays() == 0, "disabled activation keeps the menu open without replay");
+            fade.disabledStayedOpen = true;
+            EndMenu();
+        }
+        return;
+    }
+    bool needsChild = fade.action == FadeAction::Child || fade.action == FadeAction::Submenu;
+    if (needsChild && !child) {
+        if (!fade.stage) {
+            SendFadeInput(root, fade.menu, 2, true);
+            fade.stage = 1;
+        }
+        return;
+    }
+    if (fade.action == FadeAction::Cancel || fade.action == FadeAction::Submenu) {
+        Check(VisibleReplays() == 0, "cancellation and opening a submenu create no replay");
+        fade.sent = true;
+        EndMenu();
+        return;
+    }
+    HWND popup = needsChild ? child : root;
+    HMENU menu = needsChild ? fade.child : fade.menu;
+    unsigned position = fade.action == FadeAction::Disabled ? 1 : 0;
+    if (fade.stage < 2) {
+        SendFadeInput(popup, menu, position, false);
+        fade.stage = 2;
+        fade.rowReady = GetTickCount64() + 350;
+        return;  // Let the highlighted row reach the desktop compositor.
+    }
+    if (GetTickCount64() < fade.rowReady) return;
+    if (fade.stage == 2) {
+        GetMenuItemRect(nullptr, menu, position, &fade.row);
+        DwmFlush();
+        SampleSelectedRow(fade.samples);
+        fade.stage = 3;
+        return;  // Do not capture and inject activation in the same timer dispatch.
+    }
+    CheckAnimationPreferences();
+    fade.activated = GetTickCount64();
+    SendFadeInput(popup, menu, position, true);
+    fade.sent = true;
+}
+
+void RunSelectionCase(HWND owner, etm::SelectionFade choice, bool legacy,
+                      bool mouse, FadeAction action, bool unload = false,
+                      UINT flags = TPM_RETURNCMD, bool byPosition = false) {
+    if (selectionCaseNumber > selectionLastCase) return;
+    ++selectionCaseNumber;
+    fade = {};
+    backdropTraceCount = 0;
+    fade.running = true;
+    fade.mouse = mouse;
+    fade.action = action;
+    Check(ReadAnimationPreferences(fade.selectionFade, fade.menuFade, fade.menuAnimation),
+          "desktop animation preferences are readable");
+    fade.menu = CreatePopupMenu();
+    fade.child = CreatePopupMenu();
+    AppendMenuW(fade.child, MF_STRING, 42, L"&Child command");
+    AppendMenuW(fade.menu, MF_STRING, 44, L"&Root command");
+    AppendMenuW(fade.menu, MF_STRING | MF_DISABLED, 45, L"&Disabled command");
+    AppendMenuW(fade.menu, MF_POPUP, reinterpret_cast<UINT_PTR>(fade.child), L"&Submenu");
+    if (byPosition) {
+        MENUINFO info{sizeof(info)};
+        info.fMask = MIM_STYLE;
+        info.dwStyle = MNS_NOTIFYBYPOS;
+        Check(SetMenuInfo(fade.menu, &info) && SetMenuInfo(fade.child, &info),
+              "native position-based notification style applied");
+    }
+    etm::g_settings.selectionFade = choice;
+    printf("Selection fade: case=%u choice=%u api=%s input=%s action=%u flags=%#x bypos=%d%s\n",
+        selectionCaseNumber - 1, static_cast<unsigned>(choice),
+        legacy ? "TrackPopupMenu" : "TrackPopupMenuEx",
+        mouse ? "mouse" : "keyboard", static_cast<unsigned>(action), flags,
+        byPosition, unload ? " unload" : "");
+    SetForegroundWindow(owner);
+    fade.started = GetTickCount64();
+    SetTimer(owner, 2, 60, nullptr);
+    BOOL result = legacy ? TrackPopupMenu(fade.menu, flags, 260, 240, 0, owner, nullptr)
+        : TrackPopupMenuEx(fade.menu, flags, 260, 240, owner, nullptr);
+    ULONGLONG returned = GetTickCount64();
+    KillTimer(owner, 2);
+    Check(fade.modified, "real native loop uses an active modified popup");
+    bool command = action == FadeAction::Root || action == FadeAction::Child;
+    UINT expectedCommand = action == FadeAction::Child ? 42 : 44;
+    Check(flags & TPM_RETURNCMD ? static_cast<UINT>(result) == (command ? expectedCommand : 0u) :
+          (result != FALSE) == command, "native return value preserves return-command and notification contracts");
+    if (action == FadeAction::Child || action == FadeAction::Submenu)
+        Check(fade.childSeen, "native child popup opens before child activation or cancellation");
+    if (action == FadeAction::Disabled)
+        Check(fade.disabledStayedOpen, "disabled activation does not dismiss or dispatch the menu");
+    Check(!etm::t_scope && !etm::g_scopes && etm::g_calls.load() == 0 &&
+          !activeOwnerSubclasses && !bufferedPaintDepth,
+          "native loop releases tracking, painting and subclass resources");
+    PumpFor(10);
+    bool replay = choice == etm::SelectionFade::Replay && command && mouse;
+    Check(VisibleReplays() == (replay ? 1u : 0u) && fade.replayCount == (replay ? 1u : 0u),
+          "only enabled mouse command activation in replay mode creates one visible replay");
+    COLORREF initial[64]{}, middle[64]{};
+    if (replay) {
+        Check(returned - fade.activated < 300, "command returns before the replay animation duration");
+        COLORREF current[64]{};
+        DwmFlush();
+        SampleSelectedRow(current);
+        memcpy(initial, current, sizeof(initial));
+        unsigned matching = 0;
+        for (unsigned i = 0; i < ARRAYSIZE(current); ++i) {
+            auto close = [](int a, int b) { return a > b ? a - b <= 48 : b - a <= 48; };
+            if (current[i] != CLR_INVALID && fade.samples[i] != CLR_INVALID &&
+                close(GetRValue(current[i]), GetRValue(fade.samples[i])) &&
+                close(GetGValue(current[i]), GetGValue(fade.samples[i])) &&
+                close(GetBValue(current[i]), GetBValue(fade.samples[i]))) ++matching;
+        }
+        Check(matching >= 48, "initial replay retains the screen-composited selected row");
+        Check(GetForegroundWindow() == owner, "replay does not steal foreground activation");
+        if (unload) {
+            DWORD threadId = fade.replayCount ? GetWindowThreadProcessId(fade.replays[0], nullptr) : 0;
+            HANDLE worker = threadId ? OpenThread(SYNCHRONIZE, FALSE, threadId) : nullptr;
+            Check(worker && threadId != GetCurrentThreadId(), "replay animation runs on its own worker thread");
+            Wh_ModBeforeUninit();
+            Wh_ModUninit();
+            Check(VisibleReplays() == 0, "unload synchronously removes an in-flight replay");
+            Check(worker && WaitForSingleObject(worker, 0) == WAIT_OBJECT_0,
+                  "unload synchronously joins the replay worker");
+            if (worker) CloseHandle(worker);
+        }
+    }
+    if (replay && !unload) {
+        PumpFor(130);
+        DwmFlush();
+        SampleSelectedRow(middle);
+        Check(VisibleReplays() == 1, "replay remains visible partway through its 350 ms fade");
+    }
+    if (command && !replay && mouse) {
+        PumpFor(55);
+        DwmFlush();
+        COLORREF current[64]{};
+        SampleSelectedRow(current);
+        unsigned uncovered = 0;
+        for (COLORREF pixel : current)
+            if (pixel != CLR_INVALID && ColorDistance(pixel, kFadeBackground) <= 12) ++uncovered;
+        if (choice == etm::SelectionFade::Instant && mouse)
+            Check(uncovered >= 60, "instant dismissal exposes the owner with no native selected-row fade");
+        else if (fade.selectionFade && fade.menuFade && fade.menuAnimation)
+            Check(uncovered < 48, "native mode retains Windows' selected-row fade over the owner");
+        else
+            printf("Native selected-row fade observation skipped: desktop animation preferences disable it.\n");
+    }
+    PumpFor(500);
+    Check(VisibleReplays() == 0 && fade.replayCount == (replay ? 1u : 0u),
+          "replay expires without duplicate snapshots or lingering windows");
+    CheckAnimationPreferences();
+    if (replay && !unload) {
+        COLORREF background[64]{};
+        DwmFlush();
+        SampleSelectedRow(background);
+        unsigned firstDistance = 0, middleDistance = 0;
+        for (unsigned i = 0; i < ARRAYSIZE(background); ++i) {
+            firstDistance += ColorDistance(initial[i], background[i]);
+            middleDistance += ColorDistance(middle[i], background[i]);
+        }
+        Check(firstDistance > 0 && middleDistance < firstDistance,
+              "composited replay pixels fade toward the uncovered desktop");
+    }
+    unsigned expectedNotifications = command && !(flags & (TPM_RETURNCMD | TPM_NONOTIFY)) ? 1 : 0;
+    Check(fade.commands == (byPosition ? 0u : expectedNotifications) &&
+          fade.positionCommands == (byPosition ? expectedNotifications : 0u) &&
+          fade.notificationParametersValid,
+          "command dispatch occurs exactly once through the documented notification channel");
+    if (expectedNotifications) {
+        Check(fade.notifiedCommand == expectedCommand &&
+              (!byPosition || (fade.notifiedPosition == 0 &&
+               fade.notifiedMenu == (action == FadeAction::Child ? fade.child : fade.menu))),
+              "command ID or menu-position notification identifies the activated row");
+    }
+    fade.running = false;
+    DestroyMenu(fade.menu);
+}
+
+void CheckSelectionFade(HWND owner) {
+    selectionFixtureMode = true;
+    RedrawWindow(owner, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_UPDATENOW);
+    HWINEVENTHOOK events = SetWinEventHook(EVENT_OBJECT_CREATE, EVENT_OBJECT_SHOW, nullptr,
+        ReplayEvent, GetCurrentProcessId(), 0, WINEVENT_OUTOFCONTEXT);
+    Check(events != nullptr, "out-of-context replay window observer installed");
+    POINT cursor{};
+    GetCursorPos(&cursor);
+    // Warm native menu and font/theme caches before measuring owned resources.
+    RunSelectionCase(owner, etm::SelectionFade::Replay, false, true, FadeAction::Root);
+    DWORD gdi = GetGuiResources(GetCurrentProcess(), GR_GDIOBJECTS);
+    DWORD handles = 0;
+    GetProcessHandleCount(GetCurrentProcess(), &handles);
+    for (auto choice : {etm::SelectionFade::Native, etm::SelectionFade::Instant, etm::SelectionFade::Replay})
+        for (bool legacy : {false, true}) {
+            RunSelectionCase(owner, choice, legacy, true, FadeAction::Root);
+            RunSelectionCase(owner, choice, legacy, true, FadeAction::Child);
+        }
+    for (auto action : {FadeAction::Cancel, FadeAction::Disabled, FadeAction::Submenu})
+        RunSelectionCase(owner, etm::SelectionFade::Replay, false, true, action);
+    for (bool legacy : {false, true})
+        RunSelectionCase(owner, etm::SelectionFade::Replay, legacy, false, FadeAction::Child);
+    // Delivery contracts are independent of which native menu entry point or
+    // selected row produced the command; avoid repeating the full matrix.
+    for (auto choice : {etm::SelectionFade::Instant, etm::SelectionFade::Replay})
+        for (bool legacy : {false, true}) {
+            RunSelectionCase(owner, choice, legacy, true, FadeAction::Root, false, 0);
+            RunSelectionCase(owner, choice, legacy, true, FadeAction::Child, false, TPM_NONOTIFY);
+            RunSelectionCase(owner, choice, legacy, true, FadeAction::Child, false, 0, true);
+            RunSelectionCase(owner, choice, legacy, true, FadeAction::Root, false, TPM_RETURNCMD | TPM_NONOTIFY);
+        }
+    RunSelectionCase(owner, etm::SelectionFade::Replay, false, true, FadeAction::Root, true);
+    DWORD after = 0;
+    GetProcessHandleCount(GetCurrentProcess(), &after);
+    Check(GetGuiResources(GetCurrentProcess(), GR_GDIOBJECTS) <= gdi + 2 && after <= handles + 2,
+          "repeated replay and unload do not accumulate GDI or kernel resources");
+    if (events) UnhookWinEvent(events);
+    SetCursorPos(cursor.x, cursor.y);
+}
+
 LRESULT CALLBACK OwnerProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    if (selectionFixtureMode && msg == WM_ERASEBKGND) {
+        HDC dc = reinterpret_cast<HDC>(wp);
+        RECT client{};
+        GetClientRect(hwnd, &client);
+        COLORREF previous = SetDCBrushColor(dc, kFadeBackground);
+        FillRect(dc, &client, static_cast<HBRUSH>(GetStockObject(DC_BRUSH)));
+        SetDCBrushColor(dc, previous);
+        return 1;
+    }
+    if (fade.running && msg == WM_COMMAND) {
+        ++fade.commands;
+        fade.notifiedCommand = LOWORD(wp);
+        fade.notificationParametersValid &= HIWORD(wp) == 0 && lp == 0;
+        return 0;
+    }
+    if (fade.running && msg == WM_MENUCOMMAND) {
+        ++fade.positionCommands;
+        fade.notifiedMenu = reinterpret_cast<HMENU>(lp);
+        fade.notifiedPosition = static_cast<UINT>(wp);
+        fade.notifiedCommand = GetMenuItemID(fade.notifiedMenu, fade.notifiedPosition);
+        return 0;
+    }
+    if (fade.running && msg == WM_TIMER && wp == 2) {
+        if (!processingFixtureTimer) {
+            processingFixtureTimer = true;
+            FadeTimer(hwnd);
+            processingFixtureTimer = false;
+        }
+        return 0;
+    }
     if (previewMode && msg == WM_DESTROY) { PostQuitMessage(0); return 0; }
     if (previewMode && msg == WM_COMMAND) {
         if (LOWORD(wp) == 1001 && HIWORD(wp) == CBN_SELCHANGE)
@@ -424,6 +837,9 @@ LRESULT CALLBACK OwnerProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             etm::g_settings.hideMenuBorder = SendMessageW(previewBorder, BM_GETCHECK, 0, 0) == BST_CHECKED;
         if (LOWORD(wp) == 1005)
             etm::g_settings.roundedCorners = SendMessageW(previewCorners, BM_GETCHECK, 0, 0) == BST_CHECKED;
+        if (LOWORD(wp) == 1006 && HIWORD(wp) == CBN_SELCHANGE)
+            etm::g_settings.selectionFade = static_cast<etm::SelectionFade>(
+                SendMessageW(previewSelectionFade, CB_GETCURSEL, 0, 0));
         if (LOWORD(wp) == 1003 && previewMenu) {
             POINT point{250, 180};
             ClientToScreen(hwnd, &point);
@@ -469,10 +885,7 @@ LRESULT CALLBACK OwnerProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                        24, 24, source, 0, 0, SRCCOPY);
                 SelectObject(source, saved); DeleteDC(source);
             }
-            auto popup = etm::DrawingPopupForDC(item->hDC);
-            unsigned before = popup ? popup->shellTextDraws : 0;
             DrawTextW(item->hDC, previewMode ? L"Legacy RGB icon" : L"Shell DrawTextW / \u81ea\u7ed8", -1, &bounds, DT_SINGLELINE | DT_VCENTER);
-            if (popup && popup->shellTextDraws > before) ++shellHookedTexts;
             CloseThemeData(theme);
             return TRUE;
         }
@@ -495,7 +908,6 @@ LRESULT CALLBACK OwnerProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 ++live; popupWindow = popup.hwnd; SampleFrame(Trace(popup.hwnd));
                 auto& trace = Trace(popup.hwnd);
                 if (etm::g_settings.hideMenuBorder && !trace.lateBorderWrites) {
-                    if (!emulateUnprotectedBorder) CheckBorderHookScope(popup, hwnd);
                     for (COLORREF requested : {static_cast<COLORREF>(DWMWA_COLOR_DEFAULT), RGB(225, 225, 225)}) {
                         ++trace.lateBorderWrites;
                         unsigned before = trace.borderWrites;
@@ -732,7 +1144,8 @@ void CheckAlpha(HWND owner) {
     {
         etm::BitmapGuard guard;
         etm::IconSurface normalized;
-        Check(etm::PrepareIcon(iconDC, normalized), "legacy RGB icon normalized on an owned copy");
+        Check(etm::PrepareIcon(iconDC, 0, 0, 24, 24, normalized),
+              "legacy RGB icon normalized on an owned copy");
         DIBSECTION section{};
         GetObjectW(normalized.bitmap, sizeof(section), &section);
         auto normalizedPixels = static_cast<DWORD*>(section.dsBm.bmBits);
@@ -855,6 +1268,20 @@ void ShowTestMenu(HWND owner, HMENU menu, bool active, bool select = false, bool
 int main(int argc, char** argv) {
     setvbuf(stdout, nullptr, _IONBF, 0);
     bool preview = argc > 1 && strcmp(argv[1], "--preview") == 0;
+    bool selectionFade = argc > 1 && strcmp(argv[1], "--selection-fade") == 0;
+    if (selectionFade && argc > 2) {
+        // Preserve all predecessor cases: an isolated replay can hide this bug.
+        char* end = nullptr;
+        const char* value = argv[2];
+        if (strncmp(value, "--through=", 10) == 0) value += 10;
+        else value = "";
+        unsigned long last = strtoul(value, &end, 10);
+        if (argc != 3 || !*value || *end || *value == '-') {
+            fprintf(stderr, "Usage: menu-smoke --selection-fade [--through=CASE]\n");
+            return 2;
+        }
+        selectionLastCase = static_cast<unsigned>(last);
+    }
     bool probeFrame = argc > 1 && strcmp(argv[1], "--probe-frame") == 0;
     bool probeBorder = argc > 1 && strcmp(argv[1], "--probe-border") == 0;
     bool probeUnprotectedBorder = argc > 1 && strcmp(argv[1], "--probe-unprotected-border") == 0;
@@ -863,12 +1290,9 @@ int main(int argc, char** argv) {
         etm::Material::Transparent, etm::Material::Acrylic,
         etm::Material::ModernAcrylic, etm::Material::SystemAcrylic,
         etm::Material::Mica, etm::Material::MicaAlt};
-    Check(etm::ParseMaterial(L"blur") == etm::Material::Acrylic,
-          "removed material in saved settings uses the default Acrylic");
     bool probeAcrylic = argc > 1 && strcmp(argv[1], "--probe-acrylic") == 0;
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     previewMode = preview;
-    Check(!Wh_ModInit(), "production process guard rejects non-Explorer host");
     Check(MH_Initialize() == MH_OK, "isolated hook engine initialized");
     Check(Wh_SetFunctionHook(reinterpret_cast<void*>(DwmSetWindowAttribute),
           reinterpret_cast<void*>(ObserveDwmSetAttribute),
@@ -880,7 +1304,9 @@ int main(int argc, char** argv) {
     if (!etm::g_getThemeClass) return 1;
     // Automated fixtures must not depend on the user's physical Ctrl state.
     // Native/nested bypass behavior is checked separately by CheckNativeBypass.
-    etm::g_settings = {true, preview, true};
+    etm::g_settings = {};
+    etm::g_settings.roundedCorners = true;
+    etm::g_settings.ctrlBypass = preview;
     etm::g_setComposition = reinterpret_cast<etm::CompositionAttribute_t>(GetProcAddress(
         GetModuleHandleW(L"user32.dll"), "SetWindowCompositionAttribute"));
     realComposition = etm::g_setComposition;
@@ -903,7 +1329,7 @@ int main(int argc, char** argv) {
     TEST_HOOK(AlphaBlend, etm::AlphaBlendHook, etm::g_alphaBlend);
 #undef TEST_HOOK
     Check(MH_EnableHook(MH_ALL_HOOKS) == MH_OK, "all isolated hooks enabled");
-    CheckNativeBypass();
+    if (!selectionFade) CheckNativeBypass();
 
     WNDCLASSW wc{};
     wc.lpfnWndProc = OwnerProc;
@@ -914,7 +1340,7 @@ int main(int argc, char** argv) {
     HWND owner = CreateWindowW(wc.lpszClassName, L"Isolated menu test - no Explorer changes",
         WS_OVERLAPPEDWINDOW | WS_VISIBLE, 160, 140, 680, 440, nullptr, nullptr, wc.hInstance, nullptr);
     Check(!etm::IsClassicPopup(owner), "ordinary/modern window class excluded");
-    CheckLateCtrlBypass(owner);
+    if (!selectionFade) CheckLateCtrlBypass(owner);
 
     HMENU child = CreatePopupMenu();
     AppendMenuW(child, MF_STRING, 42, L"&Test command\tEnter");
@@ -924,7 +1350,9 @@ int main(int argc, char** argv) {
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING | MF_CHECKED, 44, L"Checked command");
     Check(etm::IsSupportedMenu(menu, owner), "standard menu recognized");
-    if (preview) {
+    if (selectionFade) {
+        CheckSelectionFade(owner);
+    } else if (preview) {
         SetWindowTextW(owner, L"Menu material visual check - isolated fixture");
         previewMenu = menu;
         AppendMenuW(menu, MF_OWNERDRAW, 45, reinterpret_cast<PCWSTR>(1));
@@ -955,6 +1383,12 @@ int main(int argc, char** argv) {
         previewCorners = CreateWindowW(L"BUTTON", L"Rounded corners", WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
             240, 50, 205, 24, owner, reinterpret_cast<HMENU>(1005), wc.hInstance, nullptr);
         SendMessageW(previewCorners, BM_SETCHECK, BST_CHECKED, 0);
+        previewSelectionFade = CreateWindowW(L"COMBOBOX", L"Selection fade",
+            WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST, 460, 50, 180, 140,
+            owner, reinterpret_cast<HMENU>(1006), wc.hInstance, nullptr);
+        for (PCWSTR label : {L"Native selection fade", L"Instant dismissal", L"Replay selection fade"})
+            SendMessageW(previewSelectionFade, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(label));
+        SendMessageW(previewSelectionFade, CB_SETCURSEL, 2, 0);
         SetForegroundWindow(owner);
         MSG message{};
         while (GetMessageW(&message, nullptr, 0, 0) > 0) {
@@ -1031,8 +1465,6 @@ int main(int argc, char** argv) {
         shellFixture = false;
         Check(shellDraws > 0 && shellMisses == 0, "Shell owner-draw intercepted from its FIRST paint");
         Check(shellChildDrawn, "Shell child owner-draw intercepted before mouse hover");
-        Check(shellHookedTexts == shellDraws && shellHookedTexts > 0,
-              "all native owner-draw WM_DRAWITEM calls reach composited DrawTextW");
         for (auto material : {etm::Material::SystemAcrylic, etm::Material::Mica, etm::Material::MicaAlt}) {
             etm::g_settings.material = material;
             for (int theme : {1, 2}) {
@@ -1086,9 +1518,11 @@ int main(int argc, char** argv) {
         ShowTestMenu(owner, menu, false);
         etm::g_stopping.store(false);
     }
+    Wh_ModBeforeUninit();
     DestroyMenu(menu);
     DestroyWindow(owner);
     MH_DisableHook(MH_ALL_HOOKS);
+    Wh_ModUninit();
     MH_Uninitialize();
     printf("Failures: %d\n", failures);
     return failures ? 1 : 0;

@@ -59,6 +59,26 @@ mode and Ctrl bypass retain the complete Windows appearance.
 The option also protects the outline setting from later Shell/UxTheme updates
 while the modified menu is being tracked.
 
+### Menu item click animation
+
+**Menu item click animation** offers three choices for modified menus:
+
+| Choice | Behavior after clicking a command |
+| --- | --- |
+| Windows animation | Keep the system selection fade, including its possible black background |
+| Close immediately | Dismiss without a selection fade |
+| Recreate fade animation (default) | Fade a snapshot of the fully composited item for 350 ms |
+
+Replay captures the visible hover appearance before the pressed-state paint,
+including the material, text, and icons. Its non-interactive overlay runs on a
+separate thread, so executing the command does not wait for the animation.
+It respects Windows' selection-fade and UI-effects settings and never changes
+global animation preferences. Menu opening animations are unchanged.
+Cancellation, disabled items, submenu expansion, Native material, and Ctrl
+bypass do not create a replay. Ordinary keyboard accelerators remain native.
+If a safe capture or overlay cannot be created, the click closes immediately
+without a replay. Snapshots are static; the underlying blur is not kept live.
+
 Legacy icon repair converts copied RGB bitmaps to premultiplied alpha. Optional
 background removal clears only matching corner-connected white, black, or
 magenta regions. Disable background removal for icons with intentional borders.
@@ -132,8 +152,9 @@ Destroyed popup HWNDs release their window-owned effects without extra resets.
 
 The implementation uses version-dependent Windows interfaces: the composition
 attribute exports, UxTheme ordinal 74, the DarkMode::Menu theme, menu layout
-message 0x1e2, and Shell window properties. It does not read private Shell item
-structures, patch instructions, download symbols, or replace the menu loop.
+message 0x1e2, menu activation messages, and Shell window properties. It does not
+read private Shell item structures, patch instructions, download symbols, or
+replace the menu loop.
 
 ## Troubleshooting
 
