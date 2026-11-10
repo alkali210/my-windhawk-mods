@@ -51,6 +51,13 @@ Tint opacity changes the material, not text or icons. Theme selection controls
 the light or dark palette. Hover highlight opacity can be adjusted separately.
 Unrecognized saved material values use Acrylic.
 
+The custom hover highlight's corner radius and inset are adjustable in
+device-independent pixels (DIP), scaled for the display DPI. Their defaults
+are 4 and 0 respectively. Radius 0 gives square corners; inset is applied
+equally on all sides. The radius is limited to the available row size, and an
+inset consuming the row hides the highlight. These settings have no effect when
+highlight opacity is 0 and the native highlight is used.
+
 ## Appearance
 
 Enable **Hide menu border** to suppress the outline on modified menus. This
@@ -78,6 +85,9 @@ Cancellation, disabled items, submenu expansion, Native material, and Ctrl
 bypass do not create a replay. Ordinary keyboard accelerators remain native.
 If a safe capture or overlay cannot be created, the click closes immediately
 without a replay. Snapshots are static; the underlying blur is not kept live.
+
+Instant and Replay use the tracked root menu's `MNS_NOTIFYBYPOS` style for
+command notifications and return values, including selections in submenus.
 
 Legacy icon repair converts copied RGB bitmaps to premultiplied alpha. Optional
 background removal clears only matching corner-connected white, black, or

@@ -4,7 +4,7 @@
 // @name:zh-CN      Explorer 上下文菜单半透明
 // @description     Translucent materials and optional borderless classic context menus for File Explorer
 // @description:zh-CN 对 Explorer 经典上下文菜单应用半透明材质和可选无边框
-// @version         1.1.0
+// @version         1.2.0
 // @author          alkali210
 // @github          https://github.com/alkali210
 // @include         explorer.exe
@@ -77,6 +77,13 @@ Tint opacity changes the material, not text or icons. Theme selection controls
 the light or dark palette. Hover highlight opacity can be adjusted separately.
 Unrecognized saved material values use Acrylic.
 
+The custom hover highlight's corner radius and inset are adjustable in
+device-independent pixels (DIP), scaled for the display DPI. Their defaults
+are 4 and 0 respectively. Radius 0 gives square corners; inset is applied
+equally on all sides. The radius is limited to the available row size, and an
+inset consuming the row hides the highlight. These settings have no effect when
+highlight opacity is 0 and the native highlight is used.
+
 ## Appearance
 
 Enable **Hide menu border** to suppress the outline on modified menus. This
@@ -104,6 +111,9 @@ Cancellation, disabled items, submenu expansion, Native material, and Ctrl
 bypass do not create a replay. Ordinary keyboard accelerators remain native.
 If a safe capture or overlay cannot be created, the click closes immediately
 without a replay. Snapshots are static; the underlying blur is not kept live.
+
+Instant and Replay use the tracked root menu's `MNS_NOTIFYBYPOS` style for
+command notifications and return values, including selections in submenus.
 
 Legacy icon repair converts copied RGB bitmaps to premultiplied alpha. Optional
 background removal clears only matching corner-connected white, black, or
@@ -232,6 +242,12 @@ This implementation is distributed under GPL-3.0-or-later.
 - highlightOpacity: 28
   $name: Hover highlight opacity
   $description: 1-100 for the custom highlight. Set to 0 to use the native highlight.
+- highlightRadius: 4
+  $name: Hover highlight corner radius
+  $description: Non-negative DIP, scaled with display DPI. Set to 0 for square corners.
+- highlightInset: 0
+  $name: Hover highlight inset
+  $description: Non-negative DIP on all sides, scaled with display DPI. A large inset can hide the highlight.
 - selectionFade: replay
   $name: Menu item click animation
   $description: Applies to modified menus only. Native can briefly show a black background; Replay fades a snapshot of the composited item. Menu opening animations are unchanged.
@@ -366,6 +382,8 @@ struct Settings {
     COLORREF darkTint = RGB(32, 32, 32);
     int theme = 0;  // 0=auto, 1=light, 2=dark
     int highlightOpacity = 28;
+    int highlightRadius = 4;
+    int highlightInset = 0;
     bool repairIcons = true;
     bool removeIconBackground = true;
     bool hideMenuBorder = false;
@@ -1734,22 +1752,14 @@ bool HandleMenuClick(MenuScope& scope, Popup& popup, WPARAM position) {
         return false;
     MENUITEMINFOW item{sizeof(item)};
     item.fMask = MIIM_ID | MIIM_STATE | MIIM_FTYPE | MIIM_SUBMENU;
+    // Windows uses the tracked root's style even when a submenu differs.
     MENUINFO info{sizeof(info)};
     info.fMask = MIM_STYLE;
     if (!GetMenuItemInfoW(popup.menu, static_cast<UINT>(position), TRUE, &item) ||
-        !GetMenuInfo(popup.menu, &info) || item.hSubMenu ||
+        !GetMenuInfo(scope.rootMenu, &info) || item.hSubMenu ||
         (item.fType & MFT_SEPARATOR) ||
         (item.fState & (MFS_DISABLED | MFS_GRAYED)))
         return false;
-    if (scope.rootMenu != popup.menu) {
-        MENUINFO rootInfo{sizeof(rootInfo)};
-        rootInfo.fMask = MIM_STYLE;
-        if (!GetMenuInfo(scope.rootMenu, &rootInfo))
-            return false;
-        // The tracked root's position-notification style also governs commands
-        // selected from submenus that do not carry the style themselves.
-        info.dwStyle |= rootInfo.dwStyle & MNS_NOTIFYBYPOS;
-    }
 
     if (!popup.clickReplay || popup.replayPosition != position)
         CaptureMenuClick(scope, popup, position);
@@ -1940,29 +1950,50 @@ bool DrawHighlight(Popup& popup, HDC dc, const RECT* rect, const RECT* clip) {
         UINT dpi = GetDpiForWindow(popup.hwnd);
         if (!dpi)
             dpi = 96;
-        float inset = static_cast<float>(0);
-        float radius = static_cast<float>(MulDiv(4, dpi, 96));
+        // Use a wide intermediate so large user values cannot overflow before
+        // they are limited to the dimensions of the row.
+        LONGLONG insetPixels =
+            (static_cast<LONGLONG>(g_settings.highlightInset) * dpi + 48) / 96;
+        LONGLONG radiusPixels =
+            (static_cast<LONGLONG>(g_settings.highlightRadius) * dpi + 48) / 96;
+        float halfSide = static_cast<float>(width < height ? width : height) / 2;
+        float inset = static_cast<float>(insetPixels);
+        if (inset > halfSide)
+            inset = halfSide;
+        float radius = static_cast<float>(radiusPixels);
+        float maxRadius = halfSide - inset;
+        if (radius > maxRadius)
+            radius = maxRadius;
+        int opacity = ClampPercent(g_settings.highlightOpacity);
         COLORREF color = popup.dark ? RGB(128, 192, 255) : RGB(0, 105, 190);
         for (int y = 0; y < height; ++y)
             for (int x = 0; x < width; ++x) {
                 float px = x + 0.5f, py = y + 0.5f;
-                float cx = px < inset + radius ? inset + radius
-                           : px > width - inset - radius
-                               ? width - inset - radius
-                               : px;
-                float cy = py < inset + radius ? inset + radius
-                           : py > height - inset - radius
-                               ? height - inset - radius
-                               : py;
-                float distance =
-                    std::sqrt((px - cx) * (px - cx) + (py - cy) * (py - cy));
-                float coverage = radius + 0.5f - distance;
+                float coverage;
+                if (radius == 0) {
+                    coverage = px >= inset && px < width - inset &&
+                                       py >= inset && py < height - inset
+                                   ? 1.0f
+                                   : 0.0f;
+                } else {
+                    float cx = px < inset + radius ? inset + radius
+                               : px > width - inset - radius
+                                   ? width - inset - radius
+                                   : px;
+                    float cy = py < inset + radius ? inset + radius
+                               : py > height - inset - radius
+                                   ? height - inset - radius
+                                   : py;
+                    float distance =
+                        std::sqrt((px - cx) * (px - cx) + (py - cy) * (py - cy));
+                    coverage = radius + 0.5f - distance;
+                }
                 if (coverage < 0)
                     coverage = 0;
                 if (coverage > 1)
                     coverage = 1;
                 unsigned alpha = static_cast<unsigned>(
-                    coverage * ClampPercent(g_settings.highlightOpacity) *
+                    coverage * opacity *
                         2.55f +
                     0.5f);
                 bits[y * stride + x] = {
@@ -2769,6 +2800,10 @@ BOOL Wh_ModInit() {
                                                            : 0;
     g_settings.highlightOpacity =
         ClampPercent(Wh_GetIntSetting(L"highlightOpacity"));
+    int highlightRadius = Wh_GetIntSetting(L"highlightRadius");
+    int highlightInset = Wh_GetIntSetting(L"highlightInset");
+    g_settings.highlightRadius = highlightRadius < 0 ? 0 : highlightRadius;
+    g_settings.highlightInset = highlightInset < 0 ? 0 : highlightInset;
     g_settings.selectionFade = ParseSelectionFade(
         WindhawkUtils::StringSetting::make(L"selectionFade"));
     g_settings.repairIcons = Wh_GetIntSetting(L"repairIcons") != 0;

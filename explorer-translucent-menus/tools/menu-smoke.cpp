@@ -207,6 +207,7 @@ bool expectActive = true;
 bool selectCommand = false;
 bool sawSubmenu = false;
 bool alphaChecked = false;
+bool highlightGeometryOnly = false;
 bool cancelForUnload = false;
 bool placeNearEdge = false;
 ULONGLONG childSeenAt = 0;
@@ -240,6 +241,7 @@ BOOL WINAPI TestComposition(HWND hwnd, etm::CompositionData* data) {
 }
 
 void CheckAlpha(HWND owner);
+void CheckHighlightGeometry(HWND owner);
 
 
 void Check(bool condition, const char* name) {
@@ -399,7 +401,7 @@ unsigned selectionCaseNumber = 0;
 unsigned selectionLastCase = ~0u;
 
 enum class FadeAction { Root, Child, Cancel, Disabled, Submenu };
-enum class PositionStyle { None, RootOnly, Both };
+enum class PositionStyle { None, RootOnly, ChildOnly, Both };
 struct FadeFixture {
     bool running = false, mouse = false, sent = false;
     bool modified = false, childSeen = false, disabledStayedOpen = false;
@@ -640,13 +642,16 @@ void RunSelectionCase(HWND owner, etm::SelectionFade choice, bool legacy,
     AppendMenuW(fade.menu, MF_STRING, 44, L"&Root command");
     AppendMenuW(fade.menu, MF_STRING | MF_DISABLED, 45, L"&Disabled command");
     AppendMenuW(fade.menu, MF_POPUP, reinterpret_cast<UINT_PTR>(fade.child), L"&Submenu");
-    bool byPosition = positionStyle != PositionStyle::None;
-    if (byPosition) {
+    bool byPosition = positionStyle == PositionStyle::RootOnly ||
+                      positionStyle == PositionStyle::Both;
+    bool childByPosition = positionStyle == PositionStyle::ChildOnly ||
+                           positionStyle == PositionStyle::Both;
+    if (byPosition || childByPosition) {
         MENUINFO info{sizeof(info)};
         info.fMask = MIM_STYLE;
         info.dwStyle = MNS_NOTIFYBYPOS;
-        Check(SetMenuInfo(fade.menu, &info) &&
-              (positionStyle != PositionStyle::Both || SetMenuInfo(fade.child, &info)),
+        Check((!byPosition || SetMenuInfo(fade.menu, &info)) &&
+              (!childByPosition || SetMenuInfo(fade.child, &info)),
               "position-based notification style applied to the requested menus");
     }
     etm::g_settings.selectionFade = choice;
@@ -773,6 +778,14 @@ void CheckSelectionFade(HWND owner) {
     DWORD gdi = GetGuiResources(GetCurrentProcess(), GR_GDIOBJECTS);
     DWORD handles = 0;
     GetProcessHandleCount(GetCurrentProcess(), &handles);
+    // A style on the child alone must not replace the root's WM_COMMAND
+    // notification or change TPM_RETURNCMD. Include native as a control.
+    for (auto choice : {etm::SelectionFade::Native, etm::SelectionFade::Instant,
+                        etm::SelectionFade::Replay})
+        for (bool legacy : {false, true})
+            for (UINT flags : {0u, static_cast<UINT>(TPM_RETURNCMD)})
+                RunSelectionCase(owner, choice, legacy, true, FadeAction::Child,
+                                 false, flags, PositionStyle::ChildOnly);
     // Root-only styles govern child clicks too. A successful click still
     // returns zero with TPM_RETURNCMD when position notifications are enabled.
     for (auto choice : {etm::SelectionFade::Instant, etm::SelectionFade::Replay})
@@ -938,7 +951,8 @@ LRESULT CALLBACK OwnerProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 accepted += live;
                 if (!alphaChecked && live) {
                     alphaChecked = true;
-                    CheckAlpha(hwnd);
+                    CheckHighlightGeometry(hwnd);
+                    if (!highlightGeometryOnly) CheckAlpha(hwnd);
                 }
                 if (etm::IsSystemMaterial(etm::g_settings.material) && popupWindow) {
                     auto& trace = Trace(popupWindow);
@@ -1035,6 +1049,85 @@ LRESULT CALLBACK OwnerProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
     return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+void CheckHighlightGeometry(HWND) {
+    auto scope = etm::t_scope;
+    etm::Popup* popup = nullptr;
+    if (scope) for (unsigned i = 0; i < scope->count; ++i)
+        if (scope->popups[i].active) { popup = &scope->popups[i]; break; }
+    if (!popup) {
+        Check(false, "highlight geometry test has an active menu");
+        return;
+    }
+    UINT dpi = GetDpiForWindow(popup->hwnd);
+    if (!dpi) dpi = 96;
+    int width = MulDiv(160, dpi, 96), height = MulDiv(40, dpi, 96);
+    if (width <= 0 || height <= 0) {
+        Check(false, "highlight geometry test has valid dimensions");
+        return;
+    }
+    BITMAPINFO info{};
+    info.bmiHeader = {sizeof(BITMAPINFOHEADER), width, -height, 1, 32, BI_RGB};
+    DWORD* pixels = nullptr;
+    etm::IconSurface image;
+    image.dc = CreateCompatibleDC(nullptr);
+    image.bitmap = CreateDIBSection(nullptr, &info, DIB_RGB_COLORS,
+        reinterpret_cast<void**>(&pixels), nullptr, 0);
+    if (image.dc && image.bitmap) image.old = SelectObject(image.dc, image.bitmap);
+    if (!pixels || !image.old || image.old == HGDI_ERROR) {
+        Check(false, "highlight geometry test has a drawing surface");
+        return;
+    }
+    int savedRadius = etm::g_settings.highlightRadius;
+    int savedInset = etm::g_settings.highlightInset;
+    int savedOpacity = etm::g_settings.highlightOpacity;
+    etm::g_settings.highlightOpacity = 80;
+    RECT row{0, 0, width, height};
+    auto draw = [&](int radius, int inset) {
+        etm::g_settings.highlightRadius = radius;
+        etm::g_settings.highlightInset = inset;
+        memset(pixels, 0, static_cast<size_t>(width) * height * sizeof(DWORD));
+        bool rendered = etm::DrawHighlight(*popup, image.dc, &row, nullptr);
+        GdiFlush();
+        return rendered;
+    };
+    auto alpha = [&](int x, int y) { return pixels[y * width + x] >> 24; };
+    Check(draw(4, 0), "default highlight geometry renders");
+    unsigned center = alpha(width / 2, height / 2);
+    Check(center > 0 && (MulDiv(4, dpi, 96) > 0
+          ? alpha(0, 0) < center : alpha(0, 0) == center),
+          "default highlight retains rounded corners and a visible center");
+    Check(draw(0, 0), "square highlight renders");
+    center = alpha(width / 2, height / 2);
+    Check(center > 0 && alpha(0, 0) == center && alpha(width - 1, height - 1) == center,
+          "zero radius produces a full-opacity square highlight");
+    Check(draw(0, 2), "inset highlight renders");
+    int inset = MulDiv(2, dpi, 96);
+    if (inset > 0) {
+        Check(alpha(inset - 1, height / 2) == 0 && alpha(inset, height / 2) > 0 &&
+              alpha(width - inset, height / 2) == 0 && alpha(width - inset - 1, height / 2) > 0 &&
+              alpha(width / 2, inset - 1) == 0 && alpha(width / 2, inset) > 0 &&
+              alpha(width / 2, height - inset) == 0 && alpha(width / 2, height - inset - 1) > 0,
+              "configured inset leaves equal transparent margins on all sides");
+    }
+    Check(draw(8, 2), "rounded inset highlight renders");
+    center = alpha(width / 2, height / 2);
+    Check(center > 0 && alpha(inset, inset) < center &&
+          alpha(inset, height / 2) == center && alpha(width / 2, inset) == center,
+          "configured radius rounds the inset corners without shrinking straight edges");
+    Check(draw(0x7fffffff, 0), "oversized highlight radius renders");
+    center = alpha(width / 2, height / 2);
+    Check(center > 0 && alpha(0, 0) < center,
+          "oversized radius is limited to the available row");
+    Check(draw(4, 0x7fffffff), "oversized highlight inset renders");
+    bool transparent = true;
+    for (int i = 0; i < width * height; ++i)
+        transparent = transparent && (pixels[i] >> 24) == 0;
+    Check(transparent, "an inset consuming the row produces no highlight");
+    etm::g_settings.highlightRadius = savedRadius;
+    etm::g_settings.highlightInset = savedInset;
+    etm::g_settings.highlightOpacity = savedOpacity;
 }
 
 void CheckAlpha(HWND owner) {
@@ -1305,6 +1398,8 @@ int main(int argc, char** argv) {
         etm::Material::ModernAcrylic, etm::Material::SystemAcrylic,
         etm::Material::Mica, etm::Material::MicaAlt};
     bool probeAcrylic = argc > 1 && strcmp(argv[1], "--probe-acrylic") == 0;
+    bool probeHighlight = argc > 1 && strcmp(argv[1], "--probe-highlight") == 0;
+    highlightGeometryOnly = probeHighlight;
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     previewMode = preview;
     Check(MH_Initialize() == MH_OK, "isolated hook engine initialized");
@@ -1343,7 +1438,7 @@ int main(int argc, char** argv) {
     TEST_HOOK(AlphaBlend, etm::AlphaBlendHook, etm::g_alphaBlend);
 #undef TEST_HOOK
     Check(MH_EnableHook(MH_ALL_HOOKS) == MH_OK, "all isolated hooks enabled");
-    if (!selectionFade) CheckNativeBypass();
+    if (!selectionFade && !probeHighlight) CheckNativeBypass();
 
     WNDCLASSW wc{};
     wc.lpfnWndProc = OwnerProc;
@@ -1354,7 +1449,7 @@ int main(int argc, char** argv) {
     HWND owner = CreateWindowW(wc.lpszClassName, L"Isolated menu test - no Explorer changes",
         WS_OVERLAPPEDWINDOW | WS_VISIBLE, 160, 140, 680, 440, nullptr, nullptr, wc.hInstance, nullptr);
     Check(!etm::IsClassicPopup(owner), "ordinary/modern window class excluded");
-    if (!selectionFade) CheckLateCtrlBypass(owner);
+    if (!selectionFade && !probeHighlight) CheckLateCtrlBypass(owner);
 
     HMENU child = CreatePopupMenu();
     AppendMenuW(child, MF_STRING, 42, L"&Test command\tEnter");
@@ -1414,6 +1509,11 @@ int main(int argc, char** argv) {
             etm::g_settings.material = material;
             ShowTestMenu(owner, menu, material != etm::Material::Native);
         }
+    } else if (probeHighlight) {
+        // Exercise these settings on a live menu as well as the owned DIB.
+        etm::g_settings.highlightRadius = 0;
+        etm::g_settings.highlightInset = 2;
+        ShowTestMenu(owner, menu, true, true);
     } else if (probeFrame || probeAcrylic || probeBorder || probeUnprotectedBorder) {
         emulateUnprotectedBorder = probeUnprotectedBorder;
         etm::g_settings.material = probeAcrylic ? etm::Material::Acrylic : etm::Material::SystemAcrylic;
