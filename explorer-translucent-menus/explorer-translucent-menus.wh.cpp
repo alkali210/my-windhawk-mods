@@ -4,7 +4,7 @@
 // @name:zh-CN      Explorer 上下文菜单半透明
 // @description     Translucent materials and optional borderless classic context menus for File Explorer
 // @description:zh-CN 对 Explorer 经典上下文菜单应用半透明材质和可选无边框
-// @version         1.2.0
+// @version         1.2.1
 // @author          alkali210
 // @github          https://github.com/alkali210
 // @include         explorer.exe
@@ -111,6 +111,9 @@ Cancellation, disabled items, submenu expansion, Native material, and Ctrl
 bypass do not create a replay. Ordinary keyboard accelerators remain native.
 If a safe capture or overlay cannot be created, the click closes immediately
 without a replay. Snapshots are static; the underlying blur is not kept live.
+When the custom highlight is enabled, Replay uses its actual bounds, corner
+radius, and inset. If those bounds cannot be identified safely, the menu closes
+without a replay. The native highlight keeps the original rectangular snapshot.
 
 Instant and Replay use the tracked root menu's `MNS_NOTIFYBYPOS` style for
 command notifications and return values, including selections in submenus.
@@ -447,6 +450,58 @@ struct TextGuard {
     ~TextGuard() { --t_textDepth; }
 };
 
+// The highlight paint and replay mask must use the same DPI-scaled shape.
+struct HighlightGeometry {
+    int width;
+    int height;
+    float inset;
+    float radius;
+
+    bool Empty() const {
+        return inset * 2 >= width || inset * 2 >= height;
+    }
+
+    float Coverage(int x, int y) const {
+        float px = x + 0.5f, py = y + 0.5f;
+        if (radius == 0) {
+            return px >= inset && px < width - inset &&
+                           py >= inset && py < height - inset
+                       ? 1.0f
+                       : 0.0f;
+        }
+        float cx = px < inset + radius ? inset + radius
+                   : px > width - inset - radius ? width - inset - radius
+                                                 : px;
+        float cy = py < inset + radius ? inset + radius
+                   : py > height - inset - radius ? height - inset - radius
+                                                  : py;
+        float dx = px - cx, dy = py - cy;
+        if (dx == 0 && dy == 0)
+            return 1.0f;
+        float coverage = radius + 0.5f - std::sqrt(dx * dx + dy * dy);
+        return coverage < 0 ? 0 : coverage > 1 ? 1 : coverage;
+    }
+};
+
+HighlightGeometry GetHighlightGeometry(int width, int height, UINT dpi) {
+    if (!dpi)
+        dpi = 96;
+    LONGLONG insetPixels =
+        (static_cast<LONGLONG>(g_settings.highlightInset) * dpi + 48) / 96;
+    LONGLONG radiusPixels =
+        (static_cast<LONGLONG>(g_settings.highlightRadius) * dpi + 48) / 96;
+    float halfSide = static_cast<float>(width < height ? width : height) / 2;
+    float inset = static_cast<float>(insetPixels);
+    if (inset > halfSide)
+        inset = halfSide;
+    float radius = static_cast<float>(radiusPixels);
+    if (radius > halfSide - inset)
+        radius = halfSide - inset;
+    return {width, height, inset, radius};
+}
+
+enum class ReplayHighlightSpace { None, Screen, Item };
+
 // POD TLS only. In particular, nothing runs a destructor at process shutdown.
 struct SelectionReplay;
 struct Popup {
@@ -478,6 +533,9 @@ struct Popup {
     bool subclassed;
     bool preparing;
     bool layingOut;
+    RECT replayHighlightRect;
+    UINT replayHighlightItemId;
+    ReplayHighlightSpace replayHighlightSpace;
     SelectionReplay* clickReplay;
     UINT replayPosition;
 };
@@ -577,8 +635,7 @@ bool PresentSelectionReplay(const SelectionReplaySurface& surface,
     POINT source{};
     SIZE size{replay->screenRect.right - replay->screenRect.left,
               replay->screenRect.bottom - replay->screenRect.top};
-    // The snapshot is flattened to opaque premultiplied pixels at capture.
-    // Only the window's overall opacity changes during the fade.
+    // The captured pixels are premultiplied; only overall opacity changes here.
     BLENDFUNCTION blend{AC_SRC_OVER, 0, alpha, AC_SRC_ALPHA};
     return UpdateLayeredWindow(surface.hwnd, nullptr, &destination, &size,
                                surface.dc, &source, 0, &blend, ULW_ALPHA) != FALSE;
@@ -809,7 +866,28 @@ bool SelectionReplayCaptureVisible(HWND popup, const RECT& screenRect) {
     return false;
 }
 
-SelectionReplay* CaptureSelectionReplay(HWND popup, const RECT& screenRect) {
+void ApplyReplayHighlightMask(DWORD* pixels, const HighlightGeometry& geometry) {
+    for (int y = 0; y < geometry.height; ++y) {
+        for (int x = 0; x < geometry.width; ++x) {
+            DWORD& pixel = pixels[y * geometry.width + x];
+            unsigned alpha = static_cast<unsigned>(
+                geometry.Coverage(x, y) * 255.0f + 0.5f);
+            if (!alpha) {
+                pixel = 0;
+            } else if (alpha == 255) {
+                pixel |= 0xff000000;
+            } else {
+                unsigned blue = ((pixel & 0xff) * alpha + 127) / 255;
+                unsigned green = (((pixel >> 8) & 0xff) * alpha + 127) / 255;
+                unsigned red = (((pixel >> 16) & 0xff) * alpha + 127) / 255;
+                pixel = (alpha << 24) | (red << 16) | (green << 8) | blue;
+            }
+        }
+    }
+}
+
+SelectionReplay* CaptureSelectionReplay(HWND popup, const RECT& screenRect,
+                                        bool maskHighlight) {
     SelectionReplayErrorGuard errorGuard;
     SelectionReplayLockGuard lockGuard;
     if (g_selectionReplayStopping ||
@@ -821,6 +899,14 @@ SelectionReplay* CaptureSelectionReplay(HWND popup, const RECT& screenRect) {
     if (width <= 0 || height <= 0 || width > 16384 || height > 16384 ||
         width * height > 16 * 1024 * 1024)
         return nullptr;
+    HighlightGeometry geometry{};
+    if (maskHighlight) {
+        geometry = GetHighlightGeometry(static_cast<int>(width),
+                                        static_cast<int>(height),
+                                        GetDpiForWindow(popup));
+        if (geometry.Empty())
+            return nullptr;
+    }
 
     // Requiring one real monitor also rejects virtual-desktop gaps and partial
     // off-screen captures. Rows crossing a monitor seam fail conservatively.
@@ -873,9 +959,13 @@ SelectionReplay* CaptureSelectionReplay(HWND popup, const RECT& screenRect) {
         if (!GdiFlush())
             captured = false;
         if (captured) {
-            auto opaque = static_cast<DWORD*>(pixels);
-            for (LONGLONG i = 0; i < width * height; ++i)
-                opaque[i] |= 0xff000000;
+            auto* bitmapPixels = static_cast<DWORD*>(pixels);
+            if (maskHighlight) {
+                ApplyReplayHighlightMask(bitmapPixels, geometry);
+            } else {
+                for (LONGLONG i = 0; i < width * height; ++i)
+                    bitmapPixels[i] |= 0xff000000;
+            }
         }
     }
     if (old && old != HGDI_ERROR)
@@ -1175,6 +1265,7 @@ bool HasPopupChanges(const Popup& popup) {
 void RestorePopup(Popup& popup, bool destroying = false) {
     DiscardSelectionReplay(popup.clickReplay);
     popup.clickReplay = nullptr;
+    popup.replayHighlightSpace = ReplayHighlightSpace::None;
     if (!popup.active && !popup.palette && !HasPopupChanges(popup))
         return;
     popup.active = false;  // Rendering stays inert throughout rollback.
@@ -1715,6 +1806,20 @@ bool PaintBorderlessFrame(HWND hwnd, WPARAM updateRegion) {
     return success;
 }
 
+bool ResolveReplayHighlight(const Popup& popup, const RECT& itemRect,
+                            UINT itemId, RECT& highlightRect) {
+    highlightRect = popup.replayHighlightRect;
+    if (popup.replayHighlightSpace == ReplayHighlightSpace::Item) {
+        if (popup.replayHighlightItemId != itemId)
+            return false;
+        OffsetRect(&highlightRect, itemRect.left, itemRect.top);
+    } else if (popup.replayHighlightSpace != ReplayHighlightSpace::Screen) {
+        return false;
+    }
+    return !IsRectEmpty(&highlightRect) &&
+           SelectionReplayContains(itemRect, highlightRect);
+}
+
 void CaptureMenuClick(MenuScope& scope, Popup& popup, WPARAM position) {
     SelectionReplayErrorGuard errorGuard;
     DiscardSelectionReplay(popup.clickReplay);
@@ -1725,7 +1830,7 @@ void CaptureMenuClick(MenuScope& scope, Popup& popup, WPARAM position) {
     if (count <= 0 || position >= static_cast<UINT>(count))
         return;
     MENUITEMINFOW item{sizeof(item)};
-    item.fMask = MIIM_STATE | MIIM_FTYPE | MIIM_SUBMENU;
+    item.fMask = MIIM_ID | MIIM_STATE | MIIM_FTYPE | MIIM_SUBMENU;
     BOOL enabled = FALSE;
     BOOL effects = FALSE;
     RECT rect{};
@@ -1736,7 +1841,13 @@ void CaptureMenuClick(MenuScope& scope, Popup& popup, WPARAM position) {
         SystemParametersInfoW(SPI_GETUIEFFECTS, 0, &effects, 0) && effects &&
         GetMenuItemRect(scope.owner, popup.menu,
                         static_cast<UINT>(position), &rect)) {
-        popup.clickReplay = CaptureSelectionReplay(popup.hwnd, rect);
+        bool maskHighlight = g_settings.highlightOpacity != 0;
+        RECT captureRect = rect;
+        if (maskHighlight &&
+            !ResolveReplayHighlight(popup, rect, item.wID, captureRect))
+            return;
+        popup.clickReplay =
+            CaptureSelectionReplay(popup.hwnd, captureRect, maskHighlight);
         popup.replayPosition = static_cast<UINT>(position);
     }
 }
@@ -1920,9 +2031,56 @@ struct IconSurface {
     }
 };
 
+void RememberReplayHighlight(Popup& popup, HDC dc, const RECT& rect) {
+    SelectionReplayErrorGuard errorGuard;
+    POINT corners[]{{rect.left, rect.top}, {rect.right, rect.bottom}};
+    if (!LPtoDP(dc, corners, ARRAYSIZE(corners)))
+        return;
+    RECT bounds{
+        corners[0].x < corners[1].x ? corners[0].x : corners[1].x,
+        corners[0].y < corners[1].y ? corners[0].y : corners[1].y,
+        corners[0].x > corners[1].x ? corners[0].x : corners[1].x,
+        corners[0].y > corners[1].y ? corners[0].y : corners[1].y};
+    if (IsRectEmpty(&bounds))
+        return;
+    if (popup.hwnd && WindowFromDC(dc) == popup.hwnd) {
+        POINT origin{};
+        if (!GetDCOrgEx(dc, &origin))
+            return;
+        OffsetRect(&bounds, origin.x, origin.y);
+        popup.replayHighlightRect = bounds;
+        popup.replayHighlightSpace = ReplayHighlightSpace::Screen;
+        return;
+    }
+    // A verified owner-draw DC may belong to the owner or be a memory DC.
+    // Remember its bounds relative to the item until its screen rect is known.
+    const DRAWITEMSTRUCT* item = t_scope ? t_scope->drawingItem : nullptr;
+    if (!item || t_scope->paintingWindow != popup.hwnd || item->hDC != dc ||
+        item->CtlType != ODT_MENU || !(item->itemState & ODS_SELECTED) ||
+        reinterpret_cast<HMENU>(item->hwndItem) != popup.menu)
+        return;
+    POINT itemCorners[]{{item->rcItem.left, item->rcItem.top},
+                        {item->rcItem.right, item->rcItem.bottom}};
+    if (!LPtoDP(dc, itemCorners, ARRAYSIZE(itemCorners)))
+        return;
+    RECT itemRect{
+        itemCorners[0].x < itemCorners[1].x ? itemCorners[0].x : itemCorners[1].x,
+        itemCorners[0].y < itemCorners[1].y ? itemCorners[0].y : itemCorners[1].y,
+        itemCorners[0].x > itemCorners[1].x ? itemCorners[0].x : itemCorners[1].x,
+        itemCorners[0].y > itemCorners[1].y ? itemCorners[0].y : itemCorners[1].y};
+    if (!SelectionReplayContains(itemRect, bounds))
+        return;
+    OffsetRect(&bounds, -itemRect.left, -itemRect.top);
+    popup.replayHighlightRect = bounds;
+    popup.replayHighlightItemId = item->itemID;
+    popup.replayHighlightSpace = ReplayHighlightSpace::Item;
+}
+
 bool DrawHighlight(Popup& popup, HDC dc, const RECT* rect, const RECT* clip) {
     if (!rect || IsRectEmpty(rect) || !g_settings.highlightOpacity)
         return false;
+    if (g_settings.selectionFade == SelectionFade::Replay)
+        popup.replayHighlightSpace = ReplayHighlightSpace::None;
     TextGuard guard;
     int saved = SaveDC(dc);
     if (!saved)
@@ -1947,51 +2105,13 @@ bool DrawHighlight(Popup& popup, HDC dc, const RECT* rect, const RECT* clip) {
     if (SUCCEEDED(result) && (!bits || stride < width))
         result = E_FAIL;
     if (SUCCEEDED(result)) {
-        UINT dpi = GetDpiForWindow(popup.hwnd);
-        if (!dpi)
-            dpi = 96;
-        // Use a wide intermediate so large user values cannot overflow before
-        // they are limited to the dimensions of the row.
-        LONGLONG insetPixels =
-            (static_cast<LONGLONG>(g_settings.highlightInset) * dpi + 48) / 96;
-        LONGLONG radiusPixels =
-            (static_cast<LONGLONG>(g_settings.highlightRadius) * dpi + 48) / 96;
-        float halfSide = static_cast<float>(width < height ? width : height) / 2;
-        float inset = static_cast<float>(insetPixels);
-        if (inset > halfSide)
-            inset = halfSide;
-        float radius = static_cast<float>(radiusPixels);
-        float maxRadius = halfSide - inset;
-        if (radius > maxRadius)
-            radius = maxRadius;
+        HighlightGeometry geometry =
+            GetHighlightGeometry(width, height, GetDpiForWindow(popup.hwnd));
         int opacity = ClampPercent(g_settings.highlightOpacity);
         COLORREF color = popup.dark ? RGB(128, 192, 255) : RGB(0, 105, 190);
         for (int y = 0; y < height; ++y)
             for (int x = 0; x < width; ++x) {
-                float px = x + 0.5f, py = y + 0.5f;
-                float coverage;
-                if (radius == 0) {
-                    coverage = px >= inset && px < width - inset &&
-                                       py >= inset && py < height - inset
-                                   ? 1.0f
-                                   : 0.0f;
-                } else {
-                    float cx = px < inset + radius ? inset + radius
-                               : px > width - inset - radius
-                                   ? width - inset - radius
-                                   : px;
-                    float cy = py < inset + radius ? inset + radius
-                               : py > height - inset - radius
-                                   ? height - inset - radius
-                                   : py;
-                    float distance =
-                        std::sqrt((px - cx) * (px - cx) + (py - cy) * (py - cy));
-                    coverage = radius + 0.5f - distance;
-                }
-                if (coverage < 0)
-                    coverage = 0;
-                if (coverage > 1)
-                    coverage = 1;
+                float coverage = geometry.Coverage(x, y);
                 unsigned alpha = static_cast<unsigned>(
                     coverage * opacity *
                         2.55f +
@@ -2036,7 +2156,8 @@ bool DrawHighlight(Popup& popup, HDC dc, const RECT* rect, const RECT* clip) {
         if (!restored)
             RedrawWindow(popup.hwnd, nullptr, nullptr,
                          RDW_INVALIDATE | RDW_ERASE | RDW_NOCHILDREN);
-    }
+    } else if (g_settings.selectionFade == SelectionFade::Replay)
+        RememberReplayHighlight(popup, dc, *rect);
     RestoreDC(dc, saved);
     return SUCCEEDED(end);
 }

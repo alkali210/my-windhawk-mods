@@ -624,6 +624,154 @@ void FadeTimer(HWND owner) {
     fade.sent = true;
 }
 
+void CheckReplayShapePixels(bool rounded) {
+    int width = fade.row.right - fade.row.left;
+    int height = fade.row.bottom - fade.row.top;
+    if (width < 8 || height < 8) {
+        Check(false, "replay row has usable screen dimensions");
+        return;
+    }
+    HDC screen = GetDC(nullptr);
+    etm::IconSurface image;
+    image.dc = screen ? CreateCompatibleDC(screen) : nullptr;
+    BITMAPINFO info{};
+    info.bmiHeader = {sizeof(BITMAPINFOHEADER), width, -height, 1, 32, BI_RGB};
+    DWORD* pixels = nullptr;
+    if (screen)
+        image.bitmap = CreateDIBSection(screen, &info, DIB_RGB_COLORS,
+            reinterpret_cast<void**>(&pixels), nullptr, 0);
+    if (image.dc && image.bitmap) image.old = SelectObject(image.dc, image.bitmap);
+    bool captured = pixels && image.old && image.old != HGDI_ERROR &&
+        BitBlt(image.dc, 0, 0, width, height, screen, fade.row.left,
+               fade.row.top, SRCCOPY | CAPTUREBLT) && GdiFlush();
+    if (screen) ReleaseDC(nullptr, screen);
+    Check(captured, "replay screen pixels captured");
+    if (!captured) return;
+    auto distance = [&](int x, int y) {
+        DWORD pixel = pixels[y * width + x];
+        return ColorDistance(RGB((pixel >> 16) & 255, (pixel >> 8) & 255,
+                                 pixel & 255), kFadeBackground);
+    };
+    int left = 0, right = width - 1, top = 0, bottom = height - 1;
+    while (left < width && distance(left, height / 2) <= 35) ++left;
+    while (right >= 0 && distance(right, height / 2) <= 35) --right;
+    while (top < height && distance(width * 3 / 4, top) <= 35) ++top;
+    while (bottom >= 0 && distance(width * 3 / 4, bottom) <= 35) --bottom;
+    bool visible = left + 2 < right && top + 2 < bottom &&
+                   distance(width * 3 / 4, height / 2) > 35;
+    Check(visible, "replay contains a visible selected row");
+    if (!visible) return;
+    bool margins = distance(0, height / 2) <= 20 &&
+                   distance(width - 1, height / 2) <= 20 &&
+                   distance(width * 3 / 4, 0) <= 20 &&
+                   distance(width * 3 / 4, height - 1) <= 20;
+    Check(margins, "replay leaves the inset and menu margins transparent");
+    unsigned corners[] = {distance(left + 1, top + 1),
+                          distance(right - 1, top + 1),
+                          distance(left + 1, bottom - 1),
+                          distance(right - 1, bottom - 1)};
+    bool shape = true;
+    for (unsigned corner : corners)
+        shape = shape && (rounded ? corner <= 20 : corner > 35);
+    Check(shape, rounded ? "replay leaves rounded corners transparent"
+                         : "zero-radius replay keeps square corners");
+}
+
+void RunReplayShapeCase(HWND owner, int radius, bool child, bool ownerDraw,
+                        bool nativeHighlight = false) {
+    printf("Replay mask: radius=%d target=%s highlight=%s\n", radius,
+           child ? "submenu" : ownerDraw ? "owner-draw" : "root",
+           nativeHighlight ? "native" : "custom");
+    fade = {};
+    backdropTraceCount = 0;
+    fade.running = true;
+    fade.mouse = true;
+    fade.action = child ? FadeAction::Child : FadeAction::Root;
+    Check(ReadAnimationPreferences(fade.selectionFade, fade.menuFade, fade.menuAnimation),
+          "desktop animation preferences are readable");
+    fade.menu = CreatePopupMenu();
+    fade.child = CreatePopupMenu();
+    AppendMenuW(fade.child, MF_STRING, 42, L"&Child command");
+    AppendMenuW(fade.menu, ownerDraw ? MF_OWNERDRAW : MF_STRING, 44,
+                ownerDraw ? reinterpret_cast<PCWSTR>(1) : L"&Root command");
+    AppendMenuW(fade.menu, MF_STRING | MF_DISABLED, 45, L"&Disabled command");
+    AppendMenuW(fade.menu, MF_POPUP, reinterpret_cast<UINT_PTR>(fade.child), L"&Submenu");
+    if (ownerDraw) {
+        SetPropW(owner, L"ImmersiveContextMenuArray_1-44", reinterpret_cast<HANDLE>(1));
+        shellFixture = true;
+    }
+    etm::g_settings.selectionFade = etm::SelectionFade::Replay;
+    etm::g_settings.highlightOpacity = nativeHighlight ? 0 : 80;
+    etm::g_settings.highlightRadius = radius;
+    etm::g_settings.highlightInset = 4;
+    SetForegroundWindow(owner);
+    fade.started = GetTickCount64();
+    SetTimer(owner, 2, 60, nullptr);
+    BOOL result = TrackPopupMenuEx(fade.menu, TPM_RETURNCMD, 260, 240, owner, nullptr);
+    KillTimer(owner, 2);
+    Check(fade.modified && fade.sent && static_cast<UINT>(result) == (child ? 42u : 44u),
+          "real menu click selects the requested command");
+    PumpFor(5);
+    DwmFlush();
+    bool visible = VisibleReplays() == 1;
+    Check(visible, "selection replay is visible");
+    if (visible && !nativeHighlight) CheckReplayShapePixels(radius != 0);
+    PumpFor(500);
+    Check(VisibleReplays() == 0, "selection replay expires after fading");
+    CheckAnimationPreferences();
+    fade.running = false;
+    if (ownerDraw) {
+        shellFixture = false;
+        RemovePropW(owner, L"ImmersiveContextMenuArray_1-44");
+    }
+    DestroyMenu(fade.menu);
+}
+
+void CALLBACK EndReplayWarmup(HWND hwnd, UINT, UINT_PTR timer, DWORD) {
+    KillTimer(hwnd, timer);
+    EndMenu();
+}
+
+void CheckReplayMasks(HWND owner) {
+    BOOL selection = FALSE, menu = FALSE, animation = FALSE, effects = FALSE;
+    if (!ReadAnimationPreferences(selection, menu, animation) ||
+        !SystemParametersInfoW(SPI_GETUIEFFECTS, 0, &effects, 0)) {
+        Check(false, "replay animation preferences are readable");
+        return;
+    }
+    if (!selection || !effects) {
+        printf("Replay mask test skipped: Windows selection fade or UI effects are disabled.\n");
+        return;
+    }
+    auto saved = etm::g_settings;
+    selectionFixtureMode = true;
+    RedrawWindow(owner, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_UPDATENOW);
+    POINT cursor{};
+    GetCursorPos(&cursor);
+    // Prime the native menu window and theme before sending real mouse input.
+    HMENU warmup = CreatePopupMenu();
+    AppendMenuW(warmup, MF_STRING, 1, L"Warmup");
+    SetForegroundWindow(owner);
+    if (!SetTimer(owner, 3, 250, EndReplayWarmup)) {
+        Check(false, "replay warmup timer started");
+        DestroyMenu(warmup);
+        SetCursorPos(cursor.x, cursor.y);
+        etm::g_settings = saved;
+        return;
+    }
+    TrackPopupMenuEx(warmup, TPM_RETURNCMD | TPM_NOANIMATION,
+                     260, 240, owner, nullptr);
+    KillTimer(owner, 3);
+    DestroyMenu(warmup);
+    RunReplayShapeCase(owner, 10, false, false);
+    RunReplayShapeCase(owner, 0, false, false);
+    RunReplayShapeCase(owner, 10, true, false);
+    RunReplayShapeCase(owner, 10, false, true);
+    RunReplayShapeCase(owner, 10, false, false, true);
+    SetCursorPos(cursor.x, cursor.y);
+    etm::g_settings = saved;
+}
+
 void RunSelectionCase(HWND owner, etm::SelectionFade choice, bool legacy,
                       bool mouse, FadeAction action, bool unload = false,
                       UINT flags = TPM_RETURNCMD, PositionStyle positionStyle = PositionStyle::None) {
@@ -1399,6 +1547,7 @@ int main(int argc, char** argv) {
         etm::Material::Mica, etm::Material::MicaAlt};
     bool probeAcrylic = argc > 1 && strcmp(argv[1], "--probe-acrylic") == 0;
     bool probeHighlight = argc > 1 && strcmp(argv[1], "--probe-highlight") == 0;
+    bool probeReplayMask = argc > 1 && strcmp(argv[1], "--probe-replay-mask") == 0;
     highlightGeometryOnly = probeHighlight;
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     previewMode = preview;
@@ -1438,7 +1587,7 @@ int main(int argc, char** argv) {
     TEST_HOOK(AlphaBlend, etm::AlphaBlendHook, etm::g_alphaBlend);
 #undef TEST_HOOK
     Check(MH_EnableHook(MH_ALL_HOOKS) == MH_OK, "all isolated hooks enabled");
-    if (!selectionFade && !probeHighlight) CheckNativeBypass();
+    if (!selectionFade && !probeHighlight && !probeReplayMask) CheckNativeBypass();
 
     WNDCLASSW wc{};
     wc.lpfnWndProc = OwnerProc;
@@ -1449,7 +1598,7 @@ int main(int argc, char** argv) {
     HWND owner = CreateWindowW(wc.lpszClassName, L"Isolated menu test - no Explorer changes",
         WS_OVERLAPPEDWINDOW | WS_VISIBLE, 160, 140, 680, 440, nullptr, nullptr, wc.hInstance, nullptr);
     Check(!etm::IsClassicPopup(owner), "ordinary/modern window class excluded");
-    if (!selectionFade && !probeHighlight) CheckLateCtrlBypass(owner);
+    if (!selectionFade && !probeHighlight && !probeReplayMask) CheckLateCtrlBypass(owner);
 
     HMENU child = CreatePopupMenu();
     AppendMenuW(child, MF_STRING, 42, L"&Test command\tEnter");
@@ -1509,6 +1658,8 @@ int main(int argc, char** argv) {
             etm::g_settings.material = material;
             ShowTestMenu(owner, menu, material != etm::Material::Native);
         }
+    } else if (probeReplayMask) {
+        CheckReplayMasks(owner);
     } else if (probeHighlight) {
         // Exercise these settings on a live menu as well as the owned DIB.
         etm::g_settings.highlightRadius = 0;

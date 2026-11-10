@@ -85,6 +85,9 @@ Cancellation, disabled items, submenu expansion, Native material, and Ctrl
 bypass do not create a replay. Ordinary keyboard accelerators remain native.
 If a safe capture or overlay cannot be created, the click closes immediately
 without a replay. Snapshots are static; the underlying blur is not kept live.
+When the custom highlight is enabled, Replay uses its actual bounds, corner
+radius, and inset. If those bounds cannot be identified safely, the menu closes
+without a replay. The native highlight keeps the original rectangular snapshot.
 
 Instant and Replay use the tracked root menu's `MNS_NOTIFYBYPOS` style for
 command notifications and return values, including selections in submenus.
