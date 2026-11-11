@@ -4,7 +4,7 @@
 // @name:zh-CN      Explorer 上下文菜单半透明
 // @description     Translucent materials and optional borderless classic context menus for File Explorer
 // @description:zh-CN 对 Explorer 经典上下文菜单应用半透明材质和可选无边框
-// @version         1.2.1
+// @version         1.1.0
 // @author          alkali210
 // @github          https://github.com/alkali210
 // @include         explorer.exe
@@ -75,14 +75,10 @@ a menu.
 
 Tint opacity changes the material, not text or icons. Theme selection controls
 the light or dark palette. Hover highlight opacity can be adjusted separately.
-Unrecognized saved material values use Acrylic.
 
 The custom hover highlight's corner radius and inset are adjustable in
-device-independent pixels (DIP), scaled for the display DPI. Their defaults
-are 4 and 0 respectively. Radius 0 gives square corners; inset is applied
-equally on all sides. The radius is limited to the available row size, and an
-inset consuming the row hides the highlight. These settings have no effect when
-highlight opacity is 0 and the native highlight is used.
+device-independent pixels (DIP), scaled for the display DPI. 
+These settings have no effect when highlight opacity is 0 (use native highlight instead).
 
 ## Appearance
 
@@ -106,14 +102,7 @@ Replay captures the visible hover appearance before the pressed-state paint,
 including the material, text, and icons. Its non-interactive overlay runs on a
 separate thread, so executing the command does not wait for the animation.
 It respects Windows' selection-fade and UI-effects settings and never changes
-global animation preferences. Menu opening animations are unchanged.
-Cancellation, disabled items, submenu expansion, Native material, and Ctrl
-bypass do not create a replay. Ordinary keyboard accelerators remain native.
-If a safe capture or overlay cannot be created, the click closes immediately
-without a replay. Snapshots are static; the underlying blur is not kept live.
-When the custom highlight is enabled, Replay uses its actual bounds, corner
-radius, and inset. If those bounds cannot be identified safely, the menu closes
-without a replay. The native highlight keeps the original rectangular snapshot.
+global animation preferences.
 
 Instant and Replay use the tracked root menu's `MNS_NOTIFYBYPOS` style for
 command notifications and return values, including selections in submenus.
@@ -155,39 +144,23 @@ owner-draw as well.
 
 ## Compatibility
 
-Menu effects from these mods conflict when enabled on the same Explorer popups:
+Do not enable this mod alongside another renderer modifying the same Explorer menus.
 
-- [Translucent Windows](https://windhawk.net/mods/translucent-windows):
-  **Flyout effects** also renders classic menus, dropdowns, and tooltips.
-  Disable that option to remove its flyout effects.
-- [Win32 UI Modernizer](https://windhawk.net/mods/win32-ui-modernizer): set
-  **Menus and dropdowns** to **Native (no modernization)**. Both modern modes
-  apply their own acrylic rendering and disable immersive owner-draw.
+- **Translucent Windows:** disable **Windows theme custom rendering** and **Flyout effects** to remove its direct flyout rendering.
+- **Win32 UI Modernizer:** set **Menus and dropdowns** to **Native (no modernization)**.
 
-These settings turn off their direct menu features. Their remaining Explorer
-effects and shared drawing hooks depend on other settings, so compatibility
-must be evaluated with the configuration in use. To avoid their remaining hooks
-in Explorer while continuing to use them in other applications, exclude
-`explorer.exe` from their targets in Windhawk's Advanced tab.
+Other enabled features may still affect Explorer's shared drawing paths.
+To continue using those mods in other applications while avoiding their Explorer hooks,
+exclude `explorer.exe` from their targets.
 
-This mod is also compatible with
-[ExplorerBlurMica](https://github.com/Maplespe/ExplorerBlurMica), which supplies
-the main Explorer window backdrop. This mod keeps its effects confined to classic
-popup menus and leaves the main window backdrop to ExplorerBlurMica.
+This mod leaves Explorer's main window backdrop untouched and can complement ExplorerBlurMica.
 
-Unknown owner-drawn menus, custom background brushes, high contrast, remote
-sessions, disabled transparency, and recognized conflicting renderers are
-left unchanged. Settings changes reload the mod. Menu opening animations follow
-the Windows settings and the caller's flags, including when effects are active.
+Compatible with WinUI Context Menu Animation (disable Fade-in and enable
+Translucent Windows compatibility mode).
 
-Menus whose previous system-backdrop value cannot be read stay native. Unreadable
-optional dark-mode and corner preferences are left unchanged. Recorded values
-are restored on live-window cleanup; failed restores remain pending for retry.
-There are no public getters for prior blur regions or extended-frame margins,
-and the Accent getter is unavailable on some builds. Cleanup of those states is
-best-effort, not a lossless restoration guarantee for an unknown renderer. A
-missing border-color snapshot likewise uses the Windows default on cleanup.
-Destroyed popup HWNDs release their window-owned effects without extra resets.
+Including other processes (such as `taskmgr.exe`) can also apply the effects of this
+mod to the Win32 menus of those processes.However, this mod is designed for
+`explorer.exe` and has not been extensively tested with other processes.
 
 The implementation uses version-dependent Windows interfaces: the composition
 attribute exports, UxTheme ordinal 74, the DarkMode::Menu theme, menu layout
