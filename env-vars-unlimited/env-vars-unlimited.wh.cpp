@@ -4,7 +4,7 @@
 // @name:zh-CN      解除环境变量编辑器长度限制
 // @description     Allow longer values in the classic Environment Variables dialogs
 // @description:zh-CN 允许在经典环境变量对话框中编辑更长的值
-// @version         0.1.1
+// @version         0.2.0
 // @author          alkali210
 // @github          https://github.com/alkali210
 // @include         SystemPropertiesAdvanced.exe
@@ -21,9 +21,18 @@
 
 An experimental mod for the classic Windows Environment Variables dialogs. It
 supports values up to 32,766 UTF-16 code units, retains the native dialogs, and
-uses a registry transaction when saving. It is limited to the exact sysdm.cpl
-build and file hash documented in the project README. Close existing environment
-dialogs before enabling or disabling the mod.
+uses a registry transaction when saving.
+
+Only these exact x64 `sysdm.cpl` files are enabled, each identified by its
+paired SHA-256 and PDB identity: 10.0.19041.1001, 19041.5607, 22000.3197,
+22621.1078, 22621.4034, 26100.1, 26100.8115, 26100.9974, and 29708.1003.
+Other updates and architectures fail closed. The debug log reports unrecognized
+file identities so that they can be investigated.
+
+The non-host versions have only been tested using isolated binary samples on
+another Windows build, so this is still an experimental release candidate.
+Close existing environment dialogs before enabling or disabling the mod, and
+check the Windhawk debug log for `hooks activated` before saving a long value.
 */
 // ==/WindhawkModReadme==
 
@@ -42,18 +51,41 @@ dialogs before enabling or disabling the mod.
 
 namespace {
 
-// These private interfaces and the list item layout were verified for this
-// exact sysdm.cpl version. A symbol match alone does not prove ABI compatibility.
-// The PDB identity and complete file hash pin the analyzed binary. Version
-// information is not used: compatibility shims can change its reported value
-// depending on the host process, even when the DLL bytes are identical.
-constexpr GUID kSupportedPdb = {0x6fd15f0d, 0xdf7d, 0x215f,
-                                {0xcf, 0x0d, 0x41, 0xf3, 0x5b, 0x3a, 0xa8, 0x78}};
-constexpr BYTE kSupportedSha256[32] = {
-    0x20, 0x57, 0xc7, 0x91, 0x0a, 0x57, 0x68, 0x36,
-    0x81, 0x22, 0xe6, 0x90, 0x2b, 0x79, 0x9e, 0x2c,
-    0xf4, 0x37, 0xb2, 0x86, 0x58, 0x72, 0x1d, 0x9b,
-    0x03, 0xb6, 0x74, 0xac, 0x76, 0xc1, 0x0e, 0x99,
+// A symbol match alone does not establish compatibility with these private
+// interfaces. Pin each analyzed binary to its PDB identity and whole-file hash.
+struct BuildProfile {
+    PCWSTR name;
+    GUID pdb;
+    BYTE sha256[32];
+};
+constexpr BuildProfile kBuildProfiles[] = {
+    {L"10.0.29708.1003", {0x6fd15f0d, 0xdf7d, 0x215f, {0xcf,0x0d,0x41,0xf3,0x5b,0x3a,0xa8,0x78}},
+     {0x20,0x57,0xc7,0x91,0x0a,0x57,0x68,0x36,0x81,0x22,0xe6,0x90,0x2b,0x79,0x9e,0x2c,
+      0xf4,0x37,0xb2,0x86,0x58,0x72,0x1d,0x9b,0x03,0xb6,0x74,0xac,0x76,0xc1,0x0e,0x99}},
+    {L"10.0.19041.1001", {0x223f269c, 0x0392, 0x3c19, {0x93,0xbc,0x6f,0x12,0xe2,0x9e,0x3f,0x8d}},
+     {0xf4,0x28,0x07,0x95,0x7d,0xfb,0xf0,0x0e,0x77,0x96,0x9a,0x3d,0xba,0xc5,0x1a,0x6b,
+      0x87,0x09,0x07,0xe0,0x7d,0x49,0x86,0x09,0x37,0xb9,0xc1,0xfe,0x31,0x31,0x96,0xfa}},
+    {L"10.0.19041.5607", {0x127f596d, 0x0a70, 0xcefe, {0xbb,0x10,0xf3,0x4f,0x37,0x29,0xf8,0x7c}},
+     {0xaf,0xaf,0x40,0x8f,0xe3,0xdf,0x64,0xde,0x8b,0x9f,0xd7,0xc2,0x32,0xe6,0x6a,0x15,
+      0xd8,0xa0,0xe4,0x0e,0xf8,0x58,0xa3,0x3f,0xde,0x0d,0xf9,0xfb,0x7e,0x70,0x00,0xe6}},
+    {L"10.0.22000.3197", {0x8965b035, 0x3d7d, 0xe92b, {0x26,0xe0,0x9d,0x16,0x2d,0x1a,0x1a,0x43}},
+     {0x94,0xb2,0xbe,0x35,0x11,0xde,0xac,0xd7,0x98,0x10,0x4f,0x71,0x35,0x1b,0x1b,0x5e,
+      0x14,0x57,0x16,0x83,0x00,0x23,0x1e,0xd9,0xca,0xf2,0xbb,0xbc,0xeb,0x0a,0xc1,0x55}},
+    {L"10.0.22621.1078", {0xfefc55c3, 0x0332, 0xf02c, {0x95,0xb6,0xec,0xe7,0xa9,0x43,0xfe,0x14}},
+     {0x8c,0x7d,0x3f,0x1f,0xd7,0x29,0xa7,0x8d,0x30,0x86,0xe9,0x36,0x97,0x01,0xea,0x48,
+      0x09,0xef,0xd8,0x1a,0xda,0xaa,0xf8,0x97,0x98,0xf7,0x18,0xf4,0xfc,0xdf,0xa5,0x0c}},
+    {L"10.0.22621.4034", {0x408e14cd, 0x4ffd, 0x87dc, {0x7f,0xc2,0x28,0xf8,0x22,0x9e,0xc5,0x4c}},
+     {0x13,0x20,0x04,0x6b,0xd8,0x48,0x38,0x08,0x8f,0x83,0xe2,0xad,0xe7,0x8b,0x4f,0x53,
+      0x73,0x33,0x3a,0xc7,0x50,0x73,0x5f,0x90,0xf2,0xc5,0x24,0x47,0x06,0x20,0x4d,0x5c}},
+    {L"10.0.26100.1", {0x8a233b2b, 0xc64b, 0x1ece, {0x76,0x86,0x82,0x9b,0xc0,0xb4,0xd5,0xf0}},
+     {0x97,0x03,0xa8,0xf0,0xc4,0xa6,0x01,0x5d,0x86,0x22,0x52,0xa8,0xd5,0x90,0xe3,0xcd,
+      0xfe,0x5d,0x89,0x71,0xf8,0xc0,0x21,0xd4,0xd1,0xf1,0x08,0xe7,0x3e,0x1f,0xe4,0x3e}},
+    {L"10.0.26100.8115", {0x8117a039, 0xe954, 0x717d, {0x2e,0x53,0x75,0x4f,0x5b,0xa0,0xba,0xd9}},
+     {0x8e,0xf3,0x9a,0x1a,0xde,0xf6,0x9b,0x6a,0x4d,0xcb,0xfd,0xb2,0x3d,0x53,0x56,0xa0,
+      0x01,0x95,0x1c,0xe7,0x8c,0xdf,0xb2,0xc0,0x2e,0xd1,0xfc,0x0d,0xef,0x6a,0xe9,0xde}},
+    {L"10.0.26100.9974", {0x211f31f1, 0x36ea, 0xff18, {0x7b,0xaf,0x29,0x33,0xb4,0xc1,0x0f,0xea}},
+     {0xc7,0x5c,0x86,0x7b,0xef,0x91,0xce,0xa5,0xf6,0x03,0x7b,0x83,0x55,0x48,0xaa,0xca,
+      0x56,0x01,0xe7,0xe2,0x17,0x20,0x67,0xf5,0x37,0xa9,0xc1,0xf7,0xba,0x2a,0x62,0x75}},
 };
 constexpr size_t kNativeBufferChars = 4096;
 constexpr size_t kNativeInputLimit = 2047;
@@ -338,7 +370,7 @@ bool UseMarker(EditContext& context) {
     if (!context.oldItem || context.marker) {
         return true;
     }
-    auto marker = static_cast<PWSTR>(LocalAlloc(LPTR, sizeof(WCHAR)));
+    auto marker = static_cast<PWSTR>(LocalAlloc(LPTR, 2 * sizeof(WCHAR)));
     if (!marker) {
         return false;
     }
@@ -363,6 +395,9 @@ bool StageValue(EditContext& context, std::wstring value) {
     }
     context.pendingValue = std::move(value);
     context.pending = true;
+    // EVDoEdit compares the old item with its fixed work buffer. Ensure the
+    // temporary old value differs even when the user clears a long value.
+    if (context.marker) context.marker[0] = context.pendingValue.empty() ? L'\x01' : L'\0';
     // The native parent compares this fixed buffer after the modal dialog.
     // The full value is kept separately until SetVar is called.
     const size_t copy = std::min(context.pendingValue.size(), kNativeBufferChars - 1);
@@ -382,6 +417,72 @@ bool ReadControl(HWND control, std::wstring& result) {
         return false;
     }
     result.assign(buffer.data(), copied);
+    return true;
+}
+
+bool ReadPathItem(HWND list, int index, std::wstring& result) {
+    std::vector<WCHAR> buffer(kMaxValueChars + 2);
+    LVITEMW item{};
+    item.iSubItem = 0;
+    item.pszText = buffer.data();
+    item.cchTextMax = static_cast<int>(buffer.size());
+    const LRESULT length = SendMessageW(list, LVM_GETITEMTEXTW, index,
+                                        reinterpret_cast<LPARAM>(&item));
+    if (length < 0 || static_cast<size_t>(length) > kMaxValueChars) return false;
+    result.assign(buffer.data(), static_cast<size_t>(length));
+    return true;
+}
+
+bool SetPathItem(HWND list, int index, std::wstring& text) {
+    LVITEMW item{};
+    item.iSubItem = 0;
+    item.pszText = text.data();
+    return SendMessageW(list, LVM_SETITEMTEXTW, index,
+                        reinterpret_cast<LPARAM>(&item)) != FALSE;
+}
+
+// Returns true when the command was handled. The native move routines copy
+// the selected item's text through a 4096-WCHAR buffer before reinsertion.
+bool MoveLongPathItem(HWND dialog, int direction) {
+    HWND list = GetDlgItem(dialog, kPathListControl);
+    if (!list) {
+        Error(dialog, L"The path list is unavailable. No change was made.");
+        return true;
+    }
+    const int index = ListView_GetNextItem(list, -1, LVNI_SELECTED);
+    const int count = ListView_GetItemCount(list);
+    const int destination = index + direction;
+    if (index < 0 || destination < 0 || destination >= count) return false;
+
+    std::wstring selected;
+    if (!ReadPathItem(list, index, selected)) {
+        Error(dialog, L"The complete path entry could not be read. No change was made.");
+        return true;
+    }
+    if (selected.size() < kNativeBufferChars) return false;
+
+    std::wstring adjacent;
+    if (!ReadPathItem(list, destination, adjacent)) {
+        Error(dialog, L"The complete path entry could not be read. No change was made.");
+        return true;
+    }
+    if (!SetPathItem(list, index, adjacent)) {
+        Error(dialog, L"The path entry could not be moved. No change was made.");
+        return true;
+    }
+    if (!SetPathItem(list, destination, selected)) {
+        if (!SetPathItem(list, index, selected)) {
+            g_loadFailed = true;
+            Error(dialog, L"The path list could not be restored. Cancel the environment variables dialog.");
+        } else {
+            Error(dialog, L"The path entry could not be moved. No change was made.");
+        }
+        return true;
+    }
+    ListView_SetItemState(list, index, 0, LVIS_SELECTED | LVIS_FOCUSED);
+    ListView_SetItemState(list, destination, LVIS_SELECTED | LVIS_FOCUSED,
+                          LVIS_SELECTED | LVIS_FOCUSED);
+    ListView_EnsureVisible(list, destination, FALSE);
     return true;
 }
 
@@ -555,6 +656,61 @@ INT_PTR CALLBACK PathDialogHook(HWND dialog, UINT message, WPARAM wp, LPARAM lp)
             }
             return result;
         }
+        if (message == WM_NOTIFY && lp) {
+            const auto* header = reinterpret_cast<const NMHDR*>(lp);
+            HWND list = GetDlgItem(dialog, kPathListControl);
+            if (header->hwndFrom == list && header->code == LVN_BEGINLABELEDITW) {
+                const auto* info = reinterpret_cast<const NMLVDISPINFOW*>(lp);
+                INT_PTR result = g_pathDialogOriginal(dialog, message, wp, lp);
+                if (result && GetWindowLongPtrW(dialog, DWLP_MSGRESULT)) return result;
+                HWND control = reinterpret_cast<HWND>(SendMessageW(list, LVM_GETEDITCONTROL, 0, 0));
+                std::wstring value;
+                if (!control || !ReadPathItem(list, info->item.iItem, value)) {
+                    Error(dialog, L"The complete path entry could not be edited.");
+                    SetWindowLongPtrW(dialog, DWLP_MSGRESULT, TRUE);
+                    return TRUE;
+                }
+                SendMessageW(control, EM_SETLIMITTEXT, kMaxValueChars, 0);
+                if (!SetWindowTextW(control, value.c_str())) {
+                    Error(dialog, L"The complete path entry could not be displayed.");
+                    SetWindowLongPtrW(dialog, DWLP_MSGRESULT, TRUE);
+                    return TRUE;
+                }
+                return result;
+            }
+            if (header->hwndFrom == list && header->code == LVN_ENDLABELEDITW) {
+                auto* info = reinterpret_cast<NMLVDISPINFOW*>(lp);
+                HWND control = reinterpret_cast<HWND>(SendMessageW(list, LVM_GETEDITCONTROL, 0, 0));
+                if (info->item.pszText && control && GetWindowTextLengthW(control) >= 260) {
+                    std::wstring value;
+                    if (!ReadControl(control, value)) {
+                        Error(dialog, L"The complete path entry could not be read.");
+                        SetWindowLongPtrW(dialog, DWLP_MSGRESULT, FALSE);
+                        return TRUE;
+                    }
+                    NMLVDISPINFOW fullInfo = *info;
+                    fullInfo.item.pszText = value.data();
+                    INT_PTR result = g_pathDialogOriginal(dialog, message, wp,
+                                                           reinterpret_cast<LPARAM>(&fullInfo));
+                    const bool accepted = result && GetWindowLongPtrW(dialog, DWLP_MSGRESULT);
+                    if (accepted) {
+                        value.resize(wcslen(value.c_str()));
+                        if (!SetPathItem(list, info->item.iItem, value)) {
+                            Error(dialog, L"The complete path entry could not be saved.");
+                        }
+                    }
+                    // The list view supplies a 260-character notification buffer.
+                    // Reject its copy after applying the validated full value.
+                    SetWindowLongPtrW(dialog, DWLP_MSGRESULT, FALSE);
+                    return TRUE;
+                }
+            }
+        }
+        if (message == WM_COMMAND && HIWORD(wp) == BN_CLICKED &&
+            (LOWORD(wp) == 115 || LOWORD(wp) == 116) &&
+            MoveLongPathItem(dialog, LOWORD(wp) == 115 ? -1 : 1)) {
+            return TRUE;
+        }
         if (message == WM_COMMAND && LOWORD(wp) == IDOK && HIWORD(wp) == 0) {
             if (!RebuildPath(dialog, g_edit->preparedPath)) {
                 Error(dialog, L"The combined value must be at most 32,766 UTF-16 code units.");
@@ -568,6 +724,14 @@ INT_PTR CALLBACK PathDialogHook(HWND dialog, UINT message, WPARAM wp, LPARAM lp)
         return g_pathDialogOriginal(dialog, message, wp, lp);
     } catch (...) {
         g_edit->pathPrepared = false;
+        if (message == WM_NOTIFY && lp) {
+            const auto* header = reinterpret_cast<const NMHDR*>(lp);
+            if (header->code == LVN_BEGINLABELEDITW) {
+                SetWindowLongPtrW(dialog, DWLP_MSGRESULT, TRUE);
+            } else if (header->code == LVN_ENDLABELEDITW) {
+                SetWindowLongPtrW(dialog, DWLP_MSGRESULT, FALSE);
+            }
+        }
         Error(dialog, L"The complete path could not be prepared.");
         if (message == WM_INITDIALOG) EndDialog(dialog, 0);
         return TRUE;
@@ -922,7 +1086,7 @@ INT_PTR CALLBACK MainDialogHook(HWND dialog, UINT message, WPARAM wp, LPARAM lp)
     return g_mainDialogOriginal(dialog, message, wp, lp);
 }
 
-bool HasSupportedPdb(HMODULE module) {
+bool ReadPdbIdentity(HMODULE module, GUID& guid, DWORD& age) {
     const auto* base = reinterpret_cast<const BYTE*>(module);
     const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
     if (dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew <= 0 || dos->e_lfanew > 0x100000) return false;
@@ -937,17 +1101,16 @@ bool HasSupportedPdb(HMODULE module) {
         if (entry.Type != IMAGE_DEBUG_TYPE_CODEVIEW || entry.SizeOfData < 24 ||
             entry.AddressOfRawData > imageSize || entry.SizeOfData > imageSize - entry.AddressOfRawData) continue;
         const BYTE* record = base + entry.AddressOfRawData;
-        DWORD signature = 0, age = 0;
-        GUID guid{};
+        DWORD signature = 0;
         memcpy(&signature, record, sizeof(signature));
         memcpy(&guid, record + 4, sizeof(guid));
         memcpy(&age, record + 20, sizeof(age));
-        if (signature == 0x53445352 && IsEqualGUID(guid, kSupportedPdb) && age == 1) return true;
+        if (signature == 0x53445352) return true;
     }
     return false;
 }
 
-bool HasSupportedHash(PCWSTR path) {
+bool HashFile(PCWSTR path, BYTE (&digest)[32]) {
     struct File {
         HANDLE value = INVALID_HANDLE_VALUE;
         ~File() { if (value != INVALID_HANDLE_VALUE) CloseHandle(value); }
@@ -980,14 +1143,22 @@ bool HasSupportedHash(PCWSTR path) {
         if (!ReadFile(file.value, buffer, sizeof(buffer), &read, nullptr) ||
             (read && BCryptHashData(hash.value, buffer, read, 0) < 0)) return false;
     } while (read);
-    BYTE digest[sizeof(kSupportedSha256)];
-    return BCryptFinishHash(hash.value, digest, sizeof(digest), 0) >= 0 &&
-           memcmp(digest, kSupportedSha256, sizeof(digest)) == 0;
+    return BCryptFinishHash(hash.value, digest, sizeof(digest), 0) >= 0;
+}
+
+const BuildProfile* FindBuildProfile(const GUID& guid, DWORD age, const BYTE (&digest)[32]) {
+    for (const auto& profile : kBuildProfiles) {
+        if (age == 1 && IsEqualGUID(guid, profile.pdb) &&
+            memcmp(digest, profile.sha256, sizeof(digest)) == 0) return &profile;
+    }
+    return nullptr;
 }
 
 bool IsSupportedBuild(HMODULE module) {
-    if (!HasSupportedPdb(module)) {
-        Wh_Log(L"sysdm.cpl PDB identity mismatch or debug directory unavailable");
+    GUID guid{};
+    DWORD age = 0;
+    if (!ReadPdbIdentity(module, guid, age)) {
+        Wh_Log(L"sysdm.cpl debug directory unavailable");
         return false;
     }
     WCHAR path[MAX_PATH];
@@ -996,12 +1167,26 @@ bool IsSupportedBuild(HMODULE module) {
         Wh_Log(L"Could not get the sysdm.cpl path (error %lu)", GetLastError());
         return false;
     }
-    if (!HasSupportedHash(path)) {
-        Wh_Log(L"sysdm.cpl SHA-256 mismatch or file/hash read failed: %s", path);
+    BYTE digest[32]{};
+    if (!HashFile(path, digest)) {
+        Wh_Log(L"Could not hash sysdm.cpl: %s", path);
         return false;
     }
-    Wh_Log(L"Verified sysdm.cpl PDB identity and SHA-256: %s", path);
-    return true;
+    if (const BuildProfile* profile = FindBuildProfile(guid, age, digest)) {
+        Wh_Log(L"Verified sysdm.cpl profile %s: %s", profile->name, path);
+        return true;
+    }
+    WCHAR hex[65];
+    constexpr WCHAR digits[] = L"0123456789abcdef";
+    for (size_t i = 0; i < sizeof(digest); ++i) {
+        hex[2 * i] = digits[digest[i] >> 4];
+        hex[2 * i + 1] = digits[digest[i] & 15];
+    }
+    hex[64] = L'\0';
+    Wh_Log(L"Unknown sysdm.cpl: PDB=%08lx%04x%04x%02x%02x%02x%02x%02x%02x%02x%02x age=%lu SHA256=%s",
+           guid.Data1, guid.Data2, guid.Data3, guid.Data4[0], guid.Data4[1], guid.Data4[2],
+           guid.Data4[3], guid.Data4[4], guid.Data4[5], guid.Data4[6], guid.Data4[7], age, hex);
+    return false;
 }
 
 bool IsTargetProcess() {
