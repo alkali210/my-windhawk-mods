@@ -4,6 +4,7 @@
 #include <uxtheme.h>
 #include <commctrl.h>
 #include <MinHook.h>
+#include <atomic>
 #include <cstdio>
 #include <cstdarg>
 #include <cstdlib>
@@ -153,11 +154,22 @@ HRESULT WINAPI TestDwmGetAttribute(HWND hwnd, DWORD attribute, PVOID value, DWOR
     }
     return DwmGetWindowAttribute(hwnd, attribute, value, size);
 }
+HANDLE replayPresentationGate = nullptr;
+std::atomic<HANDLE> nextReplayGate{nullptr};
 BOOL WINAPI TestSetWindowPos(HWND hwnd, HWND after, int x, int y, int cx, int cy, UINT flags) {
     if (flags & SWP_FRAMECHANGED) {
         auto& trace = Trace(hwnd);
         ++trace.frames;
         trace.redrawRequested = trace.redrawRequested || !(flags & SWP_NOREDRAW);
+    }
+    if ((flags & SWP_SHOWWINDOW) && nextReplayGate.load()) {
+        wchar_t name[80]{};
+        if (GetClassNameW(hwnd, name, ARRAYSIZE(name)) &&
+            wcscmp(name, L"ExplorerTranslucentMenus.SelectionReplay") == 0) {
+            HANDLE gate = nextReplayGate.exchange(nullptr);
+            if (gate && WaitForSingleObject(gate, 2000) != WAIT_OBJECT_0)
+                return FALSE;
+        }
     }
     return SetWindowPos(hwnd, after, x, y, cx, cy, flags);
 }
@@ -484,6 +496,14 @@ void PumpFor(DWORD milliseconds) {
     } while (true);
 }
 
+unsigned WaitForVisibleReplay() {
+    ULONGLONG deadline = GetTickCount64() + 250;
+    unsigned visible;
+    while (!(visible = VisibleReplays()) && GetTickCount64() < deadline)
+        PumpFor(5);
+    return visible;
+}
+
 void SampleSelectedRow(COLORREF* samples) {
     for (unsigned i = 0; i < 64; ++i) samples[i] = CLR_INVALID;
     int width = fade.row.right - fade.row.left;
@@ -678,7 +698,7 @@ void CheckReplayShapePixels(bool rounded) {
 }
 
 void RunReplayShapeCase(HWND owner, int radius, bool child, bool ownerDraw,
-                        bool nativeHighlight = false) {
+                        bool nativeHighlight = false, HANDLE presentationGate = nullptr) {
     printf("Replay mask: radius=%d target=%s highlight=%s\n", radius,
            child ? "submenu" : ownerDraw ? "owner-draw" : "root",
            nativeHighlight ? "native" : "custom");
@@ -704,17 +724,28 @@ void RunReplayShapeCase(HWND owner, int radius, bool child, bool ownerDraw,
     etm::g_settings.highlightOpacity = nativeHighlight ? 0 : 80;
     etm::g_settings.highlightRadius = radius;
     etm::g_settings.highlightInset = 4;
+    if (presentationGate) {
+        etm::g_settings.highlightColor = etm::ParseRgbColor(L"#EF15E9", CLR_INVALID);
+        nextReplayGate.store(presentationGate);
+    }
     SetForegroundWindow(owner);
     fade.started = GetTickCount64();
     SetTimer(owner, 2, 60, nullptr);
-    BOOL result = TrackPopupMenuEx(fade.menu, TPM_RETURNCMD, 260, 240, owner, nullptr);
+    UINT flags = presentationGate ? 0 : TPM_RETURNCMD;
+    BOOL result = TrackPopupMenuEx(fade.menu, flags, 260, 240, owner, nullptr);
     KillTimer(owner, 2);
-    Check(fade.modified && fade.sent && static_cast<UINT>(result) == (child ? 42u : 44u),
+    Check(fade.modified && fade.sent &&
+          static_cast<UINT>(result) == (presentationGate ? TRUE : child ? 42u : 44u),
           "real menu click selects the requested command");
-    PumpFor(5);
-    DwmFlush();
-    bool visible = VisibleReplays() == 1;
+    if (presentationGate) {
+        PumpFor(5);
+        Check(fade.commands == 1 && fade.notifiedCommand == 44 && !VisibleReplays(),
+              "command reaches the owner while replay presentation is paused");
+        SetEvent(presentationGate);
+    }
+    bool visible = WaitForVisibleReplay() == 1;
     Check(visible, "selection replay is visible");
+    DwmFlush();
     if (visible && !nativeHighlight) CheckReplayShapePixels(radius != 0);
     PumpFor(500);
     Check(VisibleReplays() == 0, "selection replay expires after fading");
@@ -763,7 +794,10 @@ void CheckReplayMasks(HWND owner) {
                      260, 240, owner, nullptr);
     KillTimer(owner, 3);
     DestroyMenu(warmup);
-    RunReplayShapeCase(owner, 10, false, false);
+    replayPresentationGate = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    Check(replayPresentationGate != nullptr, "replay presentation gate created");
+    RunReplayShapeCase(owner, 10, false, false, false, replayPresentationGate);
+    etm::g_settings.highlightColor = saved.highlightColor;
     RunReplayShapeCase(owner, 0, false, false);
     RunReplayShapeCase(owner, 10, true, false);
     RunReplayShapeCase(owner, 10, false, true);
@@ -828,9 +862,10 @@ void RunSelectionCase(HWND owner, etm::SelectionFade choice, bool legacy,
     Check(!etm::t_scope && !etm::g_scopes && etm::g_calls.load() == 0 &&
           !activeOwnerSubclasses && !bufferedPaintDepth,
           "native loop releases tracking, painting and subclass resources");
-    PumpFor(10);
     bool replay = choice == etm::SelectionFade::Replay && command && mouse;
-    Check(VisibleReplays() == (replay ? 1u : 0u) && fade.replayCount == (replay ? 1u : 0u),
+    if (!replay) PumpFor(10);
+    unsigned visible = replay ? WaitForVisibleReplay() : VisibleReplays();
+    Check(visible == (replay ? 1u : 0u) && fade.replayCount == (replay ? 1u : 0u),
           "only enabled mouse command activation in replay mode creates one visible replay");
     COLORREF initial[64]{}, middle[64]{};
     if (replay) {
@@ -1273,6 +1308,25 @@ void CheckHighlightGeometry(HWND) {
     for (int i = 0; i < width * height; ++i)
         transparent = transparent && (pixels[i] >> 24) == 0;
     Check(transparent, "an inset consuming the row produces no highlight");
+    auto centerPixel = [&] { return pixels[(height / 2) * width + width / 2]; };
+    COLORREF savedColor = etm::g_settings.highlightColor;
+    bool savedDark = popup->dark;
+    popup->dark = false;
+    etm::g_settings.highlightColor = etm::ParseRgbColor(L"auto", CLR_INVALID);
+    Check(draw(4, 0) && centerPixel() == 0xcc005498,
+          "auto keeps the default light highlight");
+    popup->dark = true;
+    etm::g_settings.highlightColor = etm::ParseRgbColor(L"#00Z123", CLR_INVALID);
+    Check(draw(4, 0) && centerPixel() == 0xcc669acc,
+          "invalid hex falls back to the default dark highlight");
+    etm::g_settings.highlightColor = etm::ParseRgbColor(L"#fF6a00", CLR_INVALID);
+    Check(draw(4, 0) && centerPixel() == 0xcccc5500,
+          "custom RGB is drawn with the configured opacity");
+    etm::g_settings.highlightColor = etm::ParseRgbColor(L"#000000", CLR_INVALID);
+    Check(draw(4, 0) && centerPixel() == 0xcc000000,
+          "black is a valid custom highlight, not the default");
+    popup->dark = savedDark;
+    etm::g_settings.highlightColor = savedColor;
     etm::g_settings.highlightRadius = savedRadius;
     etm::g_settings.highlightInset = savedInset;
     etm::g_settings.highlightOpacity = savedOpacity;
@@ -1784,6 +1838,7 @@ int main(int argc, char** argv) {
         etm::g_stopping.store(false);
     }
     Wh_ModBeforeUninit();
+    if (replayPresentationGate) CloseHandle(replayPresentationGate);
     DestroyMenu(menu);
     DestroyWindow(owner);
     MH_DisableHook(MH_ALL_HOOKS);

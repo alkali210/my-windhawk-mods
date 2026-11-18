@@ -51,12 +51,11 @@ Tint opacity changes the material, not text or icons. Theme selection controls
 the light or dark palette. Hover highlight opacity can be adjusted separately.
 Unrecognized saved material values use Acrylic.
 
-The custom hover highlight's corner radius and inset are adjustable in
-device-independent pixels (DIP), scaled for the display DPI. Their defaults
-are 4 and 0 respectively. Radius 0 gives square corners; inset is applied
-equally on all sides. The radius is limited to the available row size, and an
-inset consuming the row hides the highlight. These settings have no effect when
-highlight opacity is 0 and the native highlight is used.
+**Hover highlight color** accepts `#RRGGBB` (for example, `#FF6A00`).
+The default `auto` keeps the existing light and dark colors; invalid values
+also use those colors. Opacity is adjustable separately.
+The corner radius and inset are measured in device-independent pixels (DIP).
+These settings have no effect when highlight opacity is 0 (native highlight).
 
 ## Appearance
 
@@ -78,7 +77,8 @@ while the modified menu is being tracked.
 
 Replay captures the visible hover appearance before the pressed-state paint,
 including the material, text, and icons. Its non-interactive overlay runs on a
-separate thread, so executing the command does not wait for the animation.
+separate thread. Menu command delivery does not wait for it to show the
+overlay or finish the fade.
 It respects Windows' selection-fade and UI-effects settings and never changes
 global animation preferences. Menu opening animations are unchanged.
 Cancellation, disabled items, submenu expansion, Native material, and Ctrl

@@ -74,11 +74,13 @@ a menu.
 | Mica / Mica Alt | Fixed Windows recipes |
 
 Tint opacity changes the material, not text or icons. Theme selection controls
-the light or dark palette. Hover highlight opacity can be adjusted separately.
+the light or dark palette.
 
-The custom hover highlight's corner radius and inset are adjustable in
-device-independent pixels (DIP), scaled for the display DPI. 
-These settings have no effect when highlight opacity is 0 (use native highlight instead).
+**Hover highlight color** accepts `#RRGGBB` (for example, `#FF6A00`).
+The default `auto` keeps the existing light and dark colors; invalid values
+also use those colors. Opacity is adjustable separately.
+The corner radius and inset are measured in device-independent pixels (DIP).
+These settings have no effect when highlight opacity is 0 (native highlight).
 
 ## Appearance
 
@@ -100,7 +102,8 @@ while the modified menu is being tracked.
 
 Replay captures the visible hover appearance before the pressed-state paint,
 including the material, text, and icons. Its non-interactive overlay runs on a
-separate thread, so executing the command does not wait for the animation.
+separate thread. Menu command delivery does not wait for it to show the
+overlay or finish the fade.
 It respects Windows' selection-fade and UI-effects settings and never changes
 global animation preferences.
 
@@ -159,7 +162,7 @@ Compatible with WinUI Context Menu Animation (disable Fade-in and enable
 Translucent Windows compatibility mode).
 
 Including other processes (such as `taskmgr.exe`) can also apply the effects of this
-mod to the Win32 menus of those processes.However, this mod is designed for
+mod to the Win32 menus of those processes. However, this mod is designed for
 `explorer.exe` and has not been extensively tested with other processes.
 
 The implementation uses version-dependent Windows interfaces: the composition
@@ -218,6 +221,9 @@ This implementation is distributed under GPL-3.0-or-later.
 - highlightOpacity: 28
   $name: Hover highlight opacity
   $description: 1-100 for the custom highlight. Set to 0 to use the native highlight.
+- highlightColor: auto
+  $name: Hover highlight color
+  $description: "#RRGGBB for both themes, or auto for the default light and dark colors. Applies only to the custom highlight."
 - highlightRadius: 4
   $name: Hover highlight corner radius
   $description: Non-negative DIP, scaled with display DPI. Set to 0 for square corners.
@@ -333,7 +339,7 @@ bool IsSystemMaterial(Material value) {
 int ClampPercent(int value) {
     return value < 0 ? 0 : value > 100 ? 100 : value;
 }
-COLORREF ParseTint(PCWSTR value, COLORREF fallback) {
+COLORREF ParseRgbColor(PCWSTR value, COLORREF fallback) {
     if (!value)
         return fallback;
     if (*value == L'#')
@@ -358,6 +364,7 @@ struct Settings {
     COLORREF darkTint = RGB(32, 32, 32);
     int theme = 0;  // 0=auto, 1=light, 2=dark
     int highlightOpacity = 28;
+    COLORREF highlightColor = CLR_INVALID;  // Default color for the popup theme.
     int highlightRadius = 4;
     int highlightInset = 0;
     bool repairIcons = true;
@@ -406,6 +413,8 @@ using CompositionAttribute_t = BOOL(WINAPI*)(HWND, CompositionData*);
 CompositionAttribute_t g_setComposition = nullptr;
 CompositionAttribute_t g_getComposition = nullptr;
 constexpr UINT kMenuSizeWindow = 0x01e2;
+constexpr UINT kMenuButtonDown = 0x01ed;  // MN_BUTTONDOWN
+constexpr UINT kMenuButtonUp = 0x01ef;    // MN_BUTTONUP
 thread_local unsigned t_textDepth = 0;
 thread_local unsigned t_observerDepth = 0;
 thread_local unsigned t_bitmapDepth = 0;
@@ -513,11 +522,9 @@ struct Popup {
     UINT replayPosition;
 };
 
-// Capture/Start/Discard preserve the caller's last-error value. Capture must run
-// on popup's owning thread, with physical screen coordinates and an already
-// painted selected row. Only the caller decides whether this is a supported,
-// active, enabled command row. Start immediately before native dismissal and
-// command dispatch; it waits for presentation, never for the fade's duration.
+// Replay helpers preserve last error. Capture runs on the popup's owning
+// thread in physical screen coordinates. Submit takes ownership after native
+// dismissal, without waiting for the worker to present the bitmap.
 // Stop is terminal and must run outside the replay worker, before mod unload.
 struct SelectionReplay {
     RECT screenRect;
@@ -531,10 +538,8 @@ SRWLOCK g_selectionReplayLock = SRWLOCK_INIT;
 HANDLE g_selectionReplayThread = nullptr;
 HANDLE g_selectionReplayStop = nullptr;
 HANDLE g_selectionReplayRequest = nullptr;
-HANDLE g_selectionReplayComplete = nullptr;
 bool g_selectionReplayStopping = false;  // Protected by the SRW lock.
 std::atomic<SelectionReplay*> g_selectionReplayPending{nullptr};
-std::atomic<bool> g_selectionReplayAccepted{false};
 
 struct SelectionReplayErrorGuard {
     DWORD error = GetLastError();
@@ -616,13 +621,13 @@ bool PresentSelectionReplay(const SelectionReplaySurface& surface,
 
 bool CreateSelectionReplaySurface(HINSTANCE instance, SelectionReplay* replay,
                                   SelectionReplaySurface& surface) {
+    surface.replay = replay;
     surface.dc = CreateCompatibleDC(nullptr);
     if (!surface.dc)
         return false;
     surface.oldBitmap = SelectObject(surface.dc, replay->bitmap);
     if (!surface.oldBitmap || surface.oldBitmap == HGDI_ERROR) {
         surface.oldBitmap = nullptr;
-        ClearSelectionReplaySurface(surface);
         return false;
     }
     surface.hwnd = CreateWindowExW(
@@ -636,15 +641,10 @@ bool CreateSelectionReplaySurface(HINSTANCE instance, SelectionReplay* replay,
     if (!surface.hwnd || !PresentSelectionReplay(surface, replay, 255) ||
         !SetWindowPos(surface.hwnd, HWND_TOPMOST, 0, 0, 0, 0,
                       SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE |
-                          SWP_SHOWWINDOW) ||
-        FAILED(DwmFlush())) {
-        // replay remains caller-owned until every presentation step succeeds.
-        ClearSelectionReplaySurface(surface);
+                          SWP_SHOWWINDOW))
         return false;
-    }
     surface.started = GetTickCount64();
     surface.alpha = 255;
-    surface.replay = replay;
     return true;
 }
 
@@ -697,15 +697,12 @@ DWORD WINAPI SelectionReplayThreadProc(void*) {
         if (result == WAIT_OBJECT_0 || result == WAIT_FAILED)
             break;
         if (result == WAIT_OBJECT_0 + 1) {
-            ClearSelectionReplaySurface(surface);
-            SelectionReplay* replay =
-                g_selectionReplayPending.load(std::memory_order_acquire);
-            bool accepted = !replay ||
-                            CreateSelectionReplaySurface(instance, replay,
-                                                         surface);
-            g_selectionReplayAccepted.store(accepted, std::memory_order_release);
-            if (!SetEvent(g_selectionReplayComplete))
-                break;
+            if (SelectionReplay* replay = g_selectionReplayPending.exchange(
+                    nullptr, std::memory_order_acq_rel)) {
+                ClearSelectionReplaySurface(surface);
+                if (!CreateSelectionReplaySurface(instance, replay, surface))
+                    ClearSelectionReplaySurface(surface);
+            }
         } else if (result == WAIT_OBJECT_0 + ARRAYSIZE(events)) {
             // Bound each batch so message traffic cannot starve stop or fade.
             MSG message;
@@ -734,13 +731,11 @@ void CloseSelectionReplayWorkerHandles() {
         CloseHandle(g_selectionReplayStop);
     if (g_selectionReplayRequest)
         CloseHandle(g_selectionReplayRequest);
-    if (g_selectionReplayComplete)
-        CloseHandle(g_selectionReplayComplete);
     g_selectionReplayThread = nullptr;
     g_selectionReplayStop = nullptr;
     g_selectionReplayRequest = nullptr;
-    g_selectionReplayComplete = nullptr;
-    g_selectionReplayPending.store(nullptr, std::memory_order_relaxed);
+    DiscardSelectionReplay(g_selectionReplayPending.exchange(
+        nullptr, std::memory_order_acq_rel));
 }
 
 bool EnsureSelectionReplayWorker() {
@@ -754,9 +749,7 @@ bool EnsureSelectionReplayWorker() {
     }
     g_selectionReplayStop = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     g_selectionReplayRequest = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-    g_selectionReplayComplete = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-    if (!g_selectionReplayStop || !g_selectionReplayRequest ||
-        !g_selectionReplayComplete) {
+    if (!g_selectionReplayStop || !g_selectionReplayRequest) {
         CloseSelectionReplayWorkerHandles();
         return false;
     }
@@ -769,29 +762,26 @@ bool EnsureSelectionReplayWorker() {
     return true;
 }
 
-// A null request cancels the preceding replay without creating another one.
-// The lock serializes callers through the acknowledgement. In particular, Stop
-// cannot close events while Start/Capture is using them. No animation wait here.
+// The newest queued replay replaces any unclaimed request. The worker takes
+// ownership with exchange, so a superseded bitmap can only be freed once.
 bool SubmitSelectionReplay(SelectionReplay* replay) {
-    g_selectionReplayAccepted.store(false, std::memory_order_relaxed);
-    g_selectionReplayPending.store(replay, std::memory_order_release);
-    if (!SetEvent(g_selectionReplayRequest)) {
-        g_selectionReplayPending.store(nullptr, std::memory_order_relaxed);
+    SelectionReplayErrorGuard errorGuard;
+    if (!replay)
         return false;
+    bool queued = false;
+    {
+        SelectionReplayLockGuard lockGuard;
+        if (!g_selectionReplayStopping && EnsureSelectionReplayWorker()) {
+            replay = g_selectionReplayPending.exchange(
+                replay, std::memory_order_acq_rel);
+            queued = SetEvent(g_selectionReplayRequest) != FALSE;
+            if (!queued)
+                DiscardSelectionReplay(g_selectionReplayPending.exchange(
+                    nullptr, std::memory_order_acq_rel));
+        }
     }
-    HANDLE events[] = {g_selectionReplayComplete, g_selectionReplayThread};
-    DWORD result = WaitForMultipleObjects(ARRAYSIZE(events), events, FALSE,
-                                          INFINITE);
-    if (result != WAIT_OBJECT_0 && result != WAIT_OBJECT_0 + 1) {
-        // Valid owned handles should not fail a wait. If they do, drain the
-        // worker before deciding whether it ever accepted the incoming bitmap.
-        SetEvent(g_selectionReplayStop);
-        WaitForSingleObject(g_selectionReplayThread, INFINITE);
-    }
-    bool accepted =
-        g_selectionReplayAccepted.load(std::memory_order_acquire);
-    g_selectionReplayPending.store(nullptr, std::memory_order_relaxed);
-    return accepted;
+    DiscardSelectionReplay(replay);
+    return queued;
 }
 
 bool SelectionReplayContains(const RECT& outer, const RECT& inner) {
@@ -862,8 +852,7 @@ void ApplyReplayHighlightMask(DWORD* pixels, const HighlightGeometry& geometry) 
 SelectionReplay* CaptureSelectionReplay(HWND popup, const RECT& screenRect,
                                         bool maskHighlight) {
     SelectionReplayErrorGuard errorGuard;
-    SelectionReplayLockGuard lockGuard;
-    if (g_selectionReplayStopping ||
+    if (g_stopping.load(std::memory_order_relaxed) ||
         GetAwarenessFromDpiAwarenessContext(GetThreadDpiAwarenessContext()) !=
             DPI_AWARENESS_PER_MONITOR_AWARE)
         return nullptr;
@@ -890,15 +879,9 @@ SelectionReplay* CaptureSelectionReplay(HWND popup, const RECT& screenRect,
         !SelectionReplayContains(monitor.rcMonitor, screenRect) ||
         FAILED(DwmIsCompositionEnabled(&composition)) || !composition)
         return nullptr;
-    if (g_selectionReplayThread) {
-        DWORD result = WaitForSingleObject(g_selectionReplayThread, 0);
-        if (result == WAIT_OBJECT_0)
-            CloseSelectionReplayWorkerHandles();
-        else if (result != WAIT_TIMEOUT || !SubmitSelectionReplay(nullptr))
-            return nullptr;
-    }
-    // Flush this UI thread's GDI work and wait for its composed screen image,
-    // also removing the preceding replay from the next desktop capture.
+    // An earlier overlay may still be visible. Reject overlapping windows
+    // rather than waiting for the worker to cancel it before capture.
+    // Flush this UI thread's GDI work and wait for its composed screen image.
     if (!GdiFlush() || FAILED(DwmFlush()) ||
         !SelectionReplayCaptureVisible(popup, screenRect))
         return nullptr;
@@ -954,26 +937,22 @@ SelectionReplay* CaptureSelectionReplay(HWND popup, const RECT& screenRect,
     return replay;
 }
 
-bool StartSelectionReplay(SelectionReplay* replay) {
-    SelectionReplayErrorGuard errorGuard;
-    if (!replay || !replay->bitmap)
-        return false;
-    SelectionReplayLockGuard lockGuard;
-    if (g_selectionReplayStopping || !EnsureSelectionReplayWorker())
-        return false;
-    return SubmitSelectionReplay(replay);
-}
-
 void StopSelectionReplays() {
     SelectionReplayErrorGuard errorGuard;
-    SelectionReplayLockGuard lockGuard;
-    g_selectionReplayStopping = true;
-    if (g_selectionReplayThread) {
-        SetEvent(g_selectionReplayStop);
-        // No owner HWND, SendMessage, UI callback or owner-thread cleanup is
-        // involved. Commands may block Explorer's UI without blocking this join.
-        WaitForSingleObject(g_selectionReplayThread, INFINITE);
+    HANDLE thread;
+    {
+        SelectionReplayLockGuard lockGuard;
+        if (g_selectionReplayStopping)
+            return;
+        g_selectionReplayStopping = true;
+        thread = g_selectionReplayThread;
+        if (thread)
+            SetEvent(g_selectionReplayStop);
     }
+    // Join on unload only, with no lock held across the wait.
+    if (thread)
+        WaitForSingleObject(thread, INFINITE);
+    SelectionReplayLockGuard lockGuard;
     CloseSelectionReplayWorkerHandles();
 }
 
@@ -1886,11 +1865,11 @@ LRESULT CALLBACK MenuPopupSubclass(HWND hwnd,
         g_stopping.load(std::memory_order_relaxed))
         return DefSubclassProc(hwnd, message, wParam, lParam);
     // Freeze the hover appearance before Windows paints a pressed item.
-    if (message == 0x01ed)
+    if (message == kMenuButtonDown)
         CaptureMenuClick(*scope, *popup, wParam);
     // MN_BUTTONUP is the native menu-item activation notification, not a raw
     // mouse-up. Its item position is validated before changing dismissal.
-    if (message == 0x01ef && HandleMenuClick(*scope, *popup, wParam))
+    if (message == kMenuButtonUp && HandleMenuClick(*scope, *popup, wParam))
         return 0;
     if (message == WM_NCPAINT && popup->active && g_settings.hideMenuBorder &&
         PaintBorderlessFrame(hwnd, wParam))
@@ -2081,7 +2060,9 @@ bool DrawHighlight(Popup& popup, HDC dc, const RECT* rect, const RECT* clip) {
         HighlightGeometry geometry =
             GetHighlightGeometry(width, height, GetDpiForWindow(popup.hwnd));
         int opacity = ClampPercent(g_settings.highlightOpacity);
-        COLORREF color = popup.dark ? RGB(128, 192, 255) : RGB(0, 105, 190);
+        COLORREF color = g_settings.highlightColor;
+        if (color == CLR_INVALID)
+            color = popup.dark ? RGB(128, 192, 255) : RGB(0, 105, 190);
         for (int y = 0; y < height; ++y)
             for (int x = 0; x < width; ++x) {
                 float coverage = geometry.Coverage(x, y);
@@ -2758,16 +2739,13 @@ BOOL TrackMenu(HMENU menu, HWND owner, UINT flags, Invoke invoke) {
             result = invoke(flags);
             resultError = GetLastError();
             if (scope.clickCommand) {
-                // Present only after the native popup is gone: its saved-bits
+                // Queue only after the native popup is gone: its saved-bits
                 // teardown must not overwrite a newly shown replay surface.
-                bool started = scope.commandReplay &&
-                               StartSelectionReplay(scope.commandReplay);
-                if (!started)
-                    DiscardSelectionReplay(scope.commandReplay);
+                bool queued = SubmitSelectionReplay(scope.commandReplay);
                 scope.commandReplay = nullptr;
-                ETM_LOG(L"Click owner=%p command=%u mode=%u replay=%d", owner,
-                        scope.commandId,
-                        static_cast<unsigned>(g_settings.selectionFade), started);
+                ETM_LOG(L"Click owner=%p command=%u mode=%u replayQueued=%d",
+                        owner, scope.commandId,
+                        static_cast<unsigned>(g_settings.selectionFade), queued);
                 // Position-based menus do not return a command ID, even with
                 // TPM_RETURNCMD; that flag still suppresses notifications.
                 result = flags & TPM_RETURNCMD
@@ -2884,9 +2862,9 @@ BOOL Wh_ModInit() {
         ETM_LOG(L"Adjustable Acrylic is unavailable; choose System Acrylic");
         return FALSE;
     }
-    g_settings.lightTint = ParseTint(
+    g_settings.lightTint = ParseRgbColor(
         WindhawkUtils::StringSetting::make(L"lightTint"), RGB(245, 245, 245));
-    g_settings.darkTint = ParseTint(
+    g_settings.darkTint = ParseRgbColor(
         WindhawkUtils::StringSetting::make(L"darkTint"), RGB(32, 32, 32));
     auto themeSetting = WindhawkUtils::StringSetting::make(L"theme");
     g_settings.theme = !_wcsicmp(themeSetting, L"dark")    ? 2
@@ -2894,6 +2872,8 @@ BOOL Wh_ModInit() {
                                                            : 0;
     g_settings.highlightOpacity =
         ClampPercent(Wh_GetIntSetting(L"highlightOpacity"));
+    g_settings.highlightColor = ParseRgbColor(
+        WindhawkUtils::StringSetting::make(L"highlightColor"), CLR_INVALID);
     int highlightRadius = Wh_GetIntSetting(L"highlightRadius");
     int highlightInset = Wh_GetIntSetting(L"highlightInset");
     g_settings.highlightRadius = highlightRadius < 0 ? 0 : highlightRadius;
