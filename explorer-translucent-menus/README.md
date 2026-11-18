@@ -48,8 +48,7 @@ a menu.
 | Mica / Mica Alt | Fixed Windows recipes |
 
 Tint opacity changes the material, not text or icons. Theme selection controls
-the light or dark palette. Hover highlight opacity can be adjusted separately.
-Unrecognized saved material values use Acrylic.
+the light or dark palette.
 
 **Hover highlight color** accepts `#RRGGBB` (for example, `#FF6A00`).
 The default `auto` keeps the existing light and dark colors; invalid values
@@ -65,9 +64,15 @@ mode and Ctrl bypass retain the complete Windows appearance.
 The option also protects the outline setting from later Shell/UxTheme updates
 while the modified menu is being tracked.
 
+Enable **Apply material to title bar menu** to also style File Explorer's
+window menu, opened by right-clicking the title bar or pressing `Alt+Space`.
+This option is off by default. It uses the same material, theme, border,
+corner, highlight, and mouse click animation settings as context menus.
+Opening animations and keyboard command activation remain native.
+
 ### Menu item click animation
 
-**Menu item click animation** offers three choices for modified menus:
+**Menu item click animation** offers three choices after mouse selection:
 
 | Choice | Behavior after clicking a command |
 | --- | --- |
@@ -80,14 +85,7 @@ including the material, text, and icons. Its non-interactive overlay runs on a
 separate thread. Menu command delivery does not wait for it to show the
 overlay or finish the fade.
 It respects Windows' selection-fade and UI-effects settings and never changes
-global animation preferences. Menu opening animations are unchanged.
-Cancellation, disabled items, submenu expansion, Native material, and Ctrl
-bypass do not create a replay. Ordinary keyboard accelerators remain native.
-If a safe capture or overlay cannot be created, the click closes immediately
-without a replay. Snapshots are static; the underlying blur is not kept live.
-When the custom highlight is enabled, Replay uses its actual bounds, corner
-radius, and inset. If those bounds cannot be identified safely, the menu closes
-without a replay. The native highlight keeps the original rectangular snapshot.
+global animation preferences.
 
 Instant and Replay use the tracked root menu's `MNS_NOTIFYBYPOS` style for
 command notifications and return values, including selections in submenus.
@@ -105,9 +103,9 @@ This mod keeps the Shell's immersive owner-draw enabled and preserves native
 menu layout, commands, and shell extensions. Effects are scoped to supported
 classic popups while a menu is tracked. Preparation validates resources before
 applying effects and exposes the popup to drawing hooks only after commit.
-Only successful state changes are recorded for cleanup. Unassociated memory
-DCs are left to Windows; owner-draw memory DCs require an exact synchronous
-WM_DRAWITEM match.
+Only successful state changes are recorded for cleanup. Memory DCs are left
+to Windows unless they match the exact target of a synchronous Shell
+`WM_DRAWITEM` or window menu draw message.
 GDI and UxTheme hooks are installed in Explorer, but forward to Windows outside
 a tracked menu. The scope is the popup effect, rather than a replacement for
 Explorer's overall interface rendering.
@@ -129,43 +127,27 @@ owner-draw as well.
 
 ## Compatibility
 
-Menu effects from these mods conflict when enabled on the same Explorer popups:
+Do not enable this mod alongside another renderer modifying the same Explorer menus.
 
-- [Translucent Windows](https://windhawk.net/mods/translucent-windows):
-  **Flyout effects** also renders classic menus, dropdowns, and tooltips.
-  Disable that option to remove its flyout effects.
-- [Win32 UI Modernizer](https://windhawk.net/mods/win32-ui-modernizer): set
-  **Menus and dropdowns** to **Native (no modernization)**. Both modern modes
-  apply their own acrylic rendering and disable immersive owner-draw.
+- **Translucent Windows:** disable **Windows theme custom rendering** and **Flyout effects** to remove its direct flyout rendering.
+- **Win32 UI Modernizer:** set **Menus and dropdowns** to **Native (no modernization)**.
 
-These settings turn off their direct menu features. Their remaining Explorer
-effects and shared drawing hooks depend on other settings, so compatibility
-must be evaluated with the configuration in use. To avoid their remaining hooks
-in Explorer while continuing to use them in other applications, exclude
-`explorer.exe` from their targets in Windhawk's Advanced tab.
+Other enabled features may still affect Explorer's shared drawing paths.
+To continue using those mods in other applications while avoiding their Explorer hooks,
+exclude `explorer.exe` from their targets.
 
-This mod is also compatible with
-[ExplorerBlurMica](https://github.com/Maplespe/ExplorerBlurMica), which supplies
-the main Explorer window backdrop. This mod keeps its effects confined to classic
-popup menus and leaves the main window backdrop to ExplorerBlurMica.
+This mod leaves Explorer's main window backdrop untouched and can complement ExplorerBlurMica.
 
-Unknown owner-drawn menus, custom background brushes, high contrast, remote
-sessions, disabled transparency, and recognized conflicting renderers are
-left unchanged. Settings changes reload the mod. Menu opening animations follow
-the Windows settings and the caller's flags, including when effects are active.
+Compatible with WinUI Context Menu Animation (disable Fade-in and enable
+Translucent Windows compatibility mode).
 
-Menus whose previous system-backdrop value cannot be read stay native. Unreadable
-optional dark-mode and corner preferences are left unchanged. Recorded values
-are restored on live-window cleanup; failed restores remain pending for retry.
-There are no public getters for prior blur regions or extended-frame margins,
-and the Accent getter is unavailable on some builds. Cleanup of those states is
-best-effort, not a lossless restoration guarantee for an unknown renderer. A
-missing border-color snapshot likewise uses the Windows default on cleanup.
-Destroyed popup HWNDs release their window-owned effects without extra resets.
+Including other processes (such as `taskmgr.exe`) can also apply the effects of this
+mod to the Win32 menus of those processes. However, this mod is designed for
+`explorer.exe` and has not been extensively tested with other processes.
 
 The implementation uses version-dependent Windows interfaces: the composition
-attribute exports, UxTheme ordinal 74, the DarkMode::Menu theme, menu layout
-message 0x1e2, menu activation messages, and Shell window properties. It does not
+attribute exports, UxTheme ordinal 74, the DarkMode::Menu theme, native menu
+layout, activation and drawing messages, and Shell window properties. It does not
 read private Shell item structures, patch instructions, download symbols, or
 replace the menu loop.
 
@@ -175,6 +157,11 @@ Enable log output in Windhawk's Advanced tab to record menu preparation,
 material and border application results, native fallback reasons, and cleanup.
 There is no separate logging setting in this mod. Native mode registers no
 menu hooks, so it reports initialization rather than individual menu openings.
+
+For the title bar option, the initialization line reports `titleBarMenu=1`
+when enabled. Look for `Title bar menu` owner, entry, and system-menu lines,
+followed by the material result. With Windhawk logging disabled, these lines
+are not emitted even if the mod is loaded.
 
 ## Credits and license
 

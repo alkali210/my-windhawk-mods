@@ -1574,6 +1574,245 @@ void ShowTestMenu(HWND owner, HMENU menu, bool active, bool select = false, bool
     }
 }
 
+bool windowMenuPaintObserved;
+bool windowMenuTinted;
+bool windowMenuSelect;
+RECT windowMenuItem;
+POINT windowMenuClick;
+unsigned windowMenuStage, systemCommands, otherCommands;
+WPARAM systemCommand;
+LPARAM systemCommandPoint;
+unsigned windowMenuEdgeContrast;
+bool windowMenuHighlight;
+
+LRESULT CALLBACK ObserveWindowMenuItem(int code, WPARAM wp, LPARAM lp) {
+    if (code == HC_ACTION) {
+        const auto& message = *reinterpret_cast<const CWPSTRUCT*>(lp);
+        if (message.message == etm::kUahDrawMenuItem && message.lParam &&
+            etm::IsClassicPopup(message.hwnd)) {
+            const auto& item = *reinterpret_cast<const DRAWITEMSTRUCT*>(message.lParam);
+            if (item.CtlType == ODT_MENU && item.itemID == SC_MAXIMIZE)
+                windowMenuItem = item.rcItem;
+        }
+    }
+    return CallNextHookEx(nullptr, code, wp, lp);
+}
+
+void CALLBACK SampleWindowMenu(HWND owner, UINT, UINT_PTR timer, DWORD) {
+    if (windowMenuStage >= 2) {
+        KillTimer(owner, timer);
+        EndMenu();
+        return;
+    }
+    MENUBARINFO bar{sizeof(bar)};
+    HWND popup = nullptr;
+    if (GetMenuBarInfo(owner, OBJID_SYSMENU, 0, &bar)) {
+        struct Search {
+            HMENU menu;
+            HWND& popup;
+        } search{GetSubMenu(bar.hMenu, 0), popup};
+        EnumThreadWindows(GetCurrentThreadId(), [](HWND hwnd, LPARAM data) -> BOOL {
+            auto& search = *reinterpret_cast<Search*>(data);
+            if (IsWindowVisible(hwnd) && etm::IsClassicPopup(hwnd) && search.menu &&
+                reinterpret_cast<HMENU>(SendMessageW(hwnd, etm::kMenuGetHandle, 0, 0)) == search.menu) {
+                search.popup = hwnd;
+                return FALSE;
+            }
+            return TRUE;
+        }, reinterpret_cast<LPARAM>(&search));
+    }
+    RECT bounds{};
+    if (popup && GetWindowRect(popup, &bounds)) {
+        DwmFlush();
+        HDC screen = GetDC(nullptr);
+        int midY = bounds.top + (bounds.bottom - bounds.top) / 4;
+        COLORREF edge = GetPixel(screen, bounds.left, midY);
+        COLORREF body = GetPixel(screen, bounds.left + 8, midY);
+        windowMenuEdgeContrast = ColorDistance(edge, body);
+        for (int row : {1, 2, 3}) {
+            COLORREF color = GetPixel(screen, bounds.right - 16,
+                bounds.top + (bounds.bottom - bounds.top) * row / 4);
+            windowMenuPaintObserved |= color != CLR_INVALID;
+            windowMenuTinted |= color != CLR_INVALID &&
+                GetRValue(color) > GetGValue(color) + 40 &&
+                GetBValue(color) > GetGValue(color) + 40;
+            printf("Title bar menu sample RGB=(%u,%u,%u)\n",
+                   GetRValue(color), GetGValue(color), GetBValue(color));
+        }
+        if (windowMenuStage == 1) {
+            COLORREF hot = GetPixel(screen, fade.row.right -
+                (fade.row.right - fade.row.left) / 5, windowMenuClick.y);
+            windowMenuHighlight = GetBValue(hot) > GetRValue(hot) + 60 &&
+                                  GetGValue(hot) > GetRValue(hot) + 45;
+        }
+        ReleaseDC(nullptr, screen);
+        if (windowMenuSelect && !IsRectEmpty(&windowMenuItem)) {
+            if (windowMenuStage++ == 0) {
+                fade.row = windowMenuItem;
+                MapWindowPoints(popup, nullptr, reinterpret_cast<POINT*>(&fade.row), 2);
+                windowMenuClick = {(fade.row.left + fade.row.right) / 2,
+                                   (fade.row.top + fade.row.bottom) / 2};
+                SetCursorPos(windowMenuClick.x, windowMenuClick.y);
+                INPUT move[2]{};
+                move[0].type = move[1].type = INPUT_MOUSE;
+                move[0].mi.dwFlags = move[1].mi.dwFlags =
+                    MOUSEEVENTF_MOVE | MOUSEEVENTF_MOVE_NOCOALESCE;
+                move[0].mi.dx = 1;
+                move[1].mi.dx = -1;
+                SendInput(2, move, sizeof(INPUT));
+            } else {
+                INPUT click[2]{};
+                click[0].type = click[1].type = INPUT_MOUSE;
+                click[0].mi.dwFlags = MOUSEEVENTF_LEFTDOWN;
+                click[1].mi.dwFlags = MOUSEEVENTF_LEFTUP;
+                Check(SendInput(2, click, sizeof(INPUT)) == 2,
+                      "clicked the native system menu's Maximize row");
+            }
+            return;
+        }
+    }
+    KillTimer(owner, timer);
+    EndMenu();
+}
+
+void CheckWindowMenu(HWND owner, bool caption, bool styled, bool select = false) {
+    windowMenuPaintObserved = windowMenuTinted = windowMenuHighlight = false;
+    windowMenuSelect = select;
+    windowMenuItem = {};
+    windowMenuStage = systemCommands = otherCommands = 0;
+    HHOOK observer = nullptr;
+    SetForegroundWindow(owner);
+    if (select) {
+        HWND foreground = GetForegroundWindow();
+        if (foreground != owner) {
+            DWORD thread = GetWindowThreadProcessId(foreground, nullptr);
+            if (thread && AttachThreadInput(GetCurrentThreadId(), thread, TRUE)) {
+                BringWindowToTop(owner);
+                SetForegroundWindow(owner);
+                AttachThreadInput(GetCurrentThreadId(), thread, FALSE);
+            }
+        }
+        RECT window{};
+        GetWindowRect(owner, &window);
+        SetCursorPos(window.left + 4, window.top + 4);
+        observer = SetWindowsHookExW(WH_CALLWNDPROC, ObserveWindowMenuItem,
+                                     nullptr, GetCurrentThreadId());
+        Check(observer && GetForegroundWindow() == owner,
+              "interactive system menu fixture is foreground and observed");
+    }
+    if (!SetTimer(owner, 4, 450, SampleWindowMenu)) {
+        Check(false, "title bar probe timer armed");
+        if (observer) UnhookWindowsHookEx(observer);
+        return;
+    }
+    if (caption) {
+        RECT bounds{};
+        GetWindowRect(owner, &bounds);
+        LPARAM point = MAKELPARAM((bounds.left + bounds.right) / 2,
+            bounds.top + GetSystemMetrics(SM_CYFRAME) +
+            GetSystemMetrics(SM_CXPADDEDBORDER) + GetSystemMetrics(SM_CYCAPTION) / 2);
+        SendMessageW(owner, WM_CONTEXTMENU, reinterpret_cast<WPARAM>(owner), point);
+    } else {
+        SendMessageW(owner, WM_SYSCOMMAND, SC_KEYMENU, L' ');
+    }
+    KillTimer(owner, 4);
+    if (observer) UnhookWindowsHookEx(observer);
+    Check(windowMenuPaintObserved && windowMenuTinted == styled,
+          styled ? "native window menu displays the selected tint"
+                 : "native window menu remains usable and untinted");
+    if (styled)
+        Check((windowMenuEdgeContrast < 55) == etm::g_settings.hideMenuBorder,
+              "the system menu's visible outline follows the hide border setting");
+    if (!select) return;
+    PumpFor(5);
+    Check(windowMenuHighlight, "the hovered system row uses the custom color");
+    Check(systemCommands == 1 && !otherCommands && systemCommand == SC_MAXIMIZE &&
+          systemCommandPoint == MAKELPARAM(windowMenuClick.x, windowMenuClick.y),
+          "selection delivers one WM_SYSCOMMAND with the native ID and click point");
+    BOOL selection = FALSE, effects = FALSE;
+    SystemParametersInfoW(SPI_GETSELECTIONFADE, 0, &selection, 0);
+    SystemParametersInfoW(SPI_GETUIEFFECTS, 0, &effects, 0);
+    bool replay = selection && effects &&
+                  etm::g_settings.selectionFade == etm::SelectionFade::Replay;
+    unsigned overlays = replay ? WaitForVisibleReplay() : VisibleReplays();
+    Check(overlays == (replay ? 1u : 0u),
+          "only Recreate shows a system menu replay overlay");
+    if (replay && overlays) {
+        DwmFlush();
+        CheckReplayShapePixels(true);
+    }
+    PumpFor(500);
+    Check(!VisibleReplays(), "system menu replay expires without lingering windows");
+}
+
+LRESULT CALLBACK WindowMenuFixtureProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
+    if (windowMenuSelect && message == WM_SYSCOMMAND && wp == SC_MAXIMIZE) {
+        ++systemCommands;
+        systemCommand = wp;
+        systemCommandPoint = lp;
+        return 0;  // Record the actual command without covering the replay.
+    }
+    if (windowMenuSelect && (message == WM_COMMAND || message == WM_MENUCOMMAND))
+        ++otherCommands;
+    // Invoke the native path without going through the old DefWindowProcW hook.
+    if (message == WM_SYSCOMMAND || message == WM_CONTEXTMENU)
+        return DefWindowProcA(hwnd, message, wp, lp);
+    return OwnerProc(hwnd, message, wp, lp);
+}
+
+int RunWindowMenuProbe() {
+    selectionFixtureMode = true;
+    etm::g_settings.styleWindowMenu = true;
+    etm::g_settings.theme = 1;
+    etm::g_settings.lightTint = RGB(220, 10, 170);
+    etm::g_settings.tintOpacity = 85;
+    etm::g_settings.highlightColor = RGB(25, 170, 235);
+    etm::g_settings.highlightOpacity = 85;
+    etm::g_settings.highlightRadius = 10;
+    etm::g_settings.highlightInset = 4;
+    WNDCLASSW wc{};
+    wc.lpfnWndProc = WindowMenuFixtureProc;
+    wc.hInstance = GetModuleHandleW(nullptr);
+    wc.lpszClassName = L"CabinetWClass";
+    if (!RegisterClassW(&wc))
+        return 1;
+    auto create = [&] {
+        return CreateWindowExW(0, wc.lpszClassName, L"Isolated title bar menu",
+            WS_OVERLAPPEDWINDOW | WS_VISIBLE, 170, 180, 620, 380,
+            nullptr, nullptr, wc.hInstance, nullptr);
+    };
+    HWND existing = create();
+    if (!existing)
+        return 1;
+    CheckWindowMenu(existing, false, false);
+    Check(WindhawkUtils::SetFunctionHook(CreateWindowExW, etm::CreateWindowExWHook,
+                                         &etm::g_createWindowEx) &&
+          MH_EnableHook(reinterpret_cast<void*>(CreateWindowExW)) == MH_OK,
+          "future Explorer windows can receive the owner observer");
+    Wh_ModAfterInit();
+    CheckWindowMenu(existing, false, true);
+    HWND created = create();
+    if (created)
+        CheckWindowMenu(created, true, true);
+    else
+        Check(false, "new Explorer fixture window created");
+    POINT cursor{};
+    GetCursorPos(&cursor);
+    etm::g_settings.hideMenuBorder = true;
+    const auto modes = {etm::SelectionFade::Native, etm::SelectionFade::Instant,
+                        etm::SelectionFade::Replay};
+    for (auto mode : modes) {
+        etm::g_settings.selectionFade = mode;
+        CheckWindowMenu(existing, false, true, true);
+    }
+    SetCursorPos(cursor.x, cursor.y);
+    Wh_ModBeforeUninit();
+    CheckWindowMenu(existing, false, false);
+    if (created) DestroyWindow(created);
+    DestroyWindow(existing);
+    return failures ? 1 : 0;
+}
+
 int main(int argc, char** argv) {
     setvbuf(stdout, nullptr, _IONBF, 0);
     bool preview = argc > 1 && strcmp(argv[1], "--preview") == 0;
@@ -1602,6 +1841,7 @@ int main(int argc, char** argv) {
     bool probeAcrylic = argc > 1 && strcmp(argv[1], "--probe-acrylic") == 0;
     bool probeHighlight = argc > 1 && strcmp(argv[1], "--probe-highlight") == 0;
     bool probeReplayMask = argc > 1 && strcmp(argv[1], "--probe-replay-mask") == 0;
+    bool probeWindowMenu = argc > 1 && strcmp(argv[1], "--probe-window-menu") == 0;
     highlightGeometryOnly = probeHighlight;
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     previewMode = preview;
@@ -1641,6 +1881,14 @@ int main(int argc, char** argv) {
     TEST_HOOK(AlphaBlend, etm::AlphaBlendHook, etm::g_alphaBlend);
 #undef TEST_HOOK
     Check(MH_EnableHook(MH_ALL_HOOKS) == MH_OK, "all isolated hooks enabled");
+    if (probeWindowMenu) {
+        int result = RunWindowMenuProbe();
+        MH_DisableHook(MH_ALL_HOOKS);
+        Wh_ModUninit();
+        MH_Uninitialize();
+        printf("Failures: %d\n", failures);
+        return result;
+    }
     if (!selectionFade && !probeHighlight && !probeReplayMask) CheckNativeBypass();
 
     WNDCLASSW wc{};
