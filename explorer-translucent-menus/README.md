@@ -72,6 +72,12 @@ This option is off by default. It uses the same material, theme, border,
 corner, highlight, and mouse click animation settings as context menus.
 Opening animations and keyboard command activation remain native.
 
+Enable **Apply material to file information tooltips** to give File Explorer's
+file-list InfoTips the same material, tint, theme, corners, and border setting.
+The option is off by default. Windows still supplies the text, layout, hover
+delay, and animations. A tooltip keeps its material through the native fade-out.
+Navigation, toolbar, and taskbar tooltips are unchanged.
+
 ### Menu item click animation
 
 **Menu item click animation** offers three choices after mouse selection:
@@ -166,6 +172,9 @@ For the title bar option, the initialization line reports `titleBarMenu=1`
 when enabled. Look for `Title bar menu` owner, entry, and system-menu lines,
 followed by the material result. With Windhawk logging disabled, these lines
 are not emitted even if the mod is loaded.
+
+For file-list InfoTips, look for `fileInfoTips=1` at initialization and a
+`File InfoTip` line when a tooltip receives the material.
 
 ## Credits and license
 

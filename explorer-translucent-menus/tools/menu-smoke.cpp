@@ -1942,6 +1942,109 @@ int RunWindowMenuProbe() {
     return failures ? 1 : 0;
 }
 
+void CheckInfoTipFade() {
+    ACTCTXW request{sizeof(request)};
+    request.lpSource = L"tools/tooltip-controls.manifest";
+    HANDLE context = CreateActCtxW(&request);
+    ULONG_PTR cookie = 0;
+    bool activated = context != INVALID_HANDLE_VALUE && ActivateActCtx(context, &cookie);
+    Check(activated, "themed common controls available for the InfoTip fixture");
+    if (!activated) {
+        if (context != INVALID_HANDLE_VALUE) ReleaseActCtx(context);
+        return;
+    }
+
+    INITCOMMONCONTROLSEX controls{sizeof(controls), ICC_WIN95_CLASSES};
+    InitCommonControlsEx(&controls);
+    HINSTANCE instance = GetModuleHandleW(nullptr);
+    auto create = [&](PCWSTR name, HWND parent, int width, int height) {
+        WNDCLASSW wc{};
+        wc.lpfnWndProc = DefWindowProcW;
+        wc.hInstance = instance;
+        wc.hbrBackground = static_cast<HBRUSH>(GetStockObject(WHITE_BRUSH));
+        wc.lpszClassName = name;
+        if (!RegisterClassW(&wc)) return HWND{};
+        return CreateWindowW(name, L"InfoTip fade fixture",
+            WS_VISIBLE | (parent ? WS_CHILD : WS_OVERLAPPEDWINDOW),
+            parent ? 0 : 200, parent ? 0 : 210, width, height, parent, nullptr, instance, nullptr);
+    };
+    HWND owner = create(L"CabinetWClass", nullptr, 660, 460);
+    HWND shell = owner ? create(L"SHELLDLL_DefView", owner, 620, 410) : nullptr;
+    HWND view = shell ? create(L"DirectUIHWND", shell, 620, 410) : nullptr;
+    HWND tip = view ? CreateWindowExW(WS_EX_TOPMOST, TOOLTIPS_CLASSW, nullptr,
+        WS_POPUP | TTS_NOPREFIX | TTS_ALWAYSTIP, 0, 0, 0, 0,
+        owner, nullptr, instance, nullptr) : nullptr;
+    Check(tip && GetWindowTheme(tip), "a real themed tooltip was created");
+    if (tip && GetWindowTheme(tip)) {
+        etm::g_settings.styleFileInfoTips = true;
+        etm::g_settings.theme = 1;
+        etm::g_settings.hideMenuBorder = true;
+        etm::g_settings.tintOpacity = 40;
+        etm::g_settings.lightTint = RGB(250, 227, 246);
+        etm::g_detachInfoTipMessage = RegisterWindowMessageW(L"ETM.Fixture.DetachInfoTip");
+        etm::AttachInfoTip(tip);
+
+        wchar_t label[] = L"Type: C++ source\r\nSize: 130 KB\r\nModified: 2026/11/21";
+        TOOLINFOW tool{sizeof(tool)};
+        tool.uFlags = TTF_TRACK | TTF_ABSOLUTE;
+        tool.hwnd = view;
+        tool.lpszText = label;
+        SendMessageW(tip, TTM_SETMAXTIPWIDTH, 0, 400);
+        Check(SendMessageW(tip, TTM_ADDTOOLW, 0, reinterpret_cast<LPARAM>(&tool)),
+              "registered a file-list tooltip tool");
+        UpdateWindow(owner);
+        POINT position{200, 150};
+        ClientToScreen(owner, &position);
+        SendMessageW(tip, TTM_TRACKPOSITION, 0, MAKELPARAM(position.x, position.y));
+        SendMessageW(tip, TTM_TRACKACTIVATE, TRUE, reinterpret_cast<LPARAM>(&tool));
+        PumpFor(380);
+        RECT bounds{};
+        GetWindowRect(tip, &bounds);
+        auto sample = [&] {
+            DwmFlush();
+            HDC dc = GetDC(nullptr);
+            COLORREF pixel = GetPixel(dc, bounds.right - 12, (bounds.top + bounds.bottom) / 2);
+            ReleaseDC(nullptr, dc);
+            return pixel;
+        };
+        COLORREF visible = sample();
+        Check(IsWindowVisible(tip) && visible != CLR_INVALID && GetGValue(visible) > 150 &&
+              GetRValue(visible) > GetGValue(visible) + 2,
+              "the visible InfoTip has a light acrylic tint");
+        SendMessageW(tip, TTM_TRACKACTIVATE, FALSE, reinterpret_cast<LPARAM>(&tool));
+        BOOL animation = FALSE, fadeEnabled = FALSE;
+        SystemParametersInfoW(SPI_GETTOOLTIPANIMATION, 0, &animation, 0);
+        SystemParametersInfoW(SPI_GETTOOLTIPFADE, 0, &fadeEnabled, 0);
+        if (animation && fadeEnabled) {
+            BYTE alpha = 255;
+            ULONGLONG deadline = GetTickCount64() + 350;
+            while (IsWindowVisible(tip) && alpha == 255 && GetTickCount64() < deadline) {
+                PumpFor(5);
+                GetLayeredWindowAttributes(tip, nullptr, &alpha, nullptr);
+            }
+            TOOLINFOW current{sizeof(current)};
+            Check(IsWindowVisible(tip) && alpha > 0 && alpha < 255 &&
+                  !SendMessageW(tip, TTM_GETCURRENTTOOLW, 0, reinterpret_cast<LPARAM>(&current)),
+                  "the native fade is visible after the current tool is cleared");
+            // Repaint while the old frame is still fading, as when moving
+            // across the file list before the next tooltip has opened.
+            RedrawWindow(tip, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_UPDATENOW);
+            COLORREF fading = sample();
+            Check(IsWindowVisible(tip) && fading != CLR_INVALID &&
+                  GetGValue(fading) + 8 >= GetGValue(visible),
+                  "repainting during the native fade does not darken the InfoTip");
+        } else {
+            puts("SKIP: tooltip fade disabled by Windows");
+        }
+        PumpFor(420);
+        Check(!IsWindowVisible(tip), "Windows finishes dismissing the InfoTip");
+    }
+    if (tip) DestroyWindow(tip);
+    if (owner) DestroyWindow(owner);
+    DeactivateActCtx(0, cookie);
+    ReleaseActCtx(context);
+}
+
 int main(int argc, char** argv) {
     setvbuf(stdout, nullptr, _IONBF, 0);
     bool preview = argc > 1 && strcmp(argv[1], "--preview") == 0;
@@ -1972,6 +2075,7 @@ int main(int argc, char** argv) {
     bool probeReplayMask = argc > 1 && strcmp(argv[1], "--probe-replay-mask") == 0;
     bool probeWindowMenu = argc > 1 && strcmp(argv[1], "--probe-window-menu") == 0;
     bool probeScrollMenu = argc > 1 && strcmp(argv[1], "--probe-scroll-menu") == 0;
+    bool probeInfoTipFade = argc > 1 && strcmp(argv[1], "--probe-infotip-fade") == 0;
     highlightGeometryOnly = probeHighlight;
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     previewMode = preview;
@@ -2011,6 +2115,14 @@ int main(int argc, char** argv) {
     TEST_HOOK(AlphaBlend, etm::AlphaBlendHook, etm::g_alphaBlend);
 #undef TEST_HOOK
     Check(MH_EnableHook(MH_ALL_HOOKS) == MH_OK, "all isolated hooks enabled");
+    if (probeInfoTipFade) {
+        CheckInfoTipFade();
+        MH_DisableHook(MH_ALL_HOOKS);
+        Wh_ModUninit();
+        MH_Uninitialize();
+        printf("Failures: %d\n", failures);
+        return failures ? 1 : 0;
+    }
     if (probeWindowMenu) {
         int result = RunWindowMenuProbe();
         MH_DisableHook(MH_ALL_HOOKS);

@@ -4,7 +4,7 @@
 // @name:zh-CN      Explorer 上下文菜单半透明
 // @description     Translucent materials and optional borderless classic context menus for File Explorer
 // @description:zh-CN 对 Explorer 经典上下文菜单应用半透明材质和可选无边框
-// @version         1.2.0
+// @version         1.3.0
 // @author          alkali210
 // @github          https://github.com/alkali210
 // @include         explorer.exe
@@ -97,6 +97,12 @@ window menu, opened by right-clicking the title bar or pressing `Alt+Space`.
 This option is off by default. It uses the same material, theme, border,
 corner, highlight, and mouse click animation settings as context menus.
 Opening animations and keyboard command activation remain native.
+
+Enable **Apply material to file information tooltips** to give File Explorer's
+file-list InfoTips the same material, tint, theme, corners, and border setting.
+The option is off by default. Windows still supplies the text, layout, hover
+delay, and animations. A tooltip keeps its material through the native fade-out.
+Navigation, toolbar, and taskbar tooltips are unchanged.
 
 ### Menu item click animation
 
@@ -254,13 +260,16 @@ This implementation is distributed under GPL-3.0-or-later.
   - replay: Recreate fade animation
 - roundedCorners: true
   $name: Rounded corners
-  $description: Request small rounded corners for modified menus.
+  $description: Request small rounded corners for modified menus and file information tooltips.
 - hideMenuBorder: true
   $name: Hide menu border
-  $description: Suppress the outline on modified menus without changing their size.
+  $description: Suppress the outline on modified menus and file information tooltips without changing their size.
 - styleWindowMenu: false
   $name: Apply material to title bar menu
   $description: Apply the same appearance and mouse click animation settings to File Explorer's title bar menu (right-click or Alt+Space).
+- styleFileInfoTips: false
+  $name: Apply material to file information tooltips
+  $description: Use the menu material, tint, theme, corners and border setting for file information tooltips in File Explorer. Other tooltips are unchanged.
 - repairIcons: true
   $name: Repair legacy icon transparency
   $description: Convert copied legacy RGB icons to premultiplied alpha without modifying the source bitmaps.
@@ -283,6 +292,7 @@ This implementation is distributed under GPL-3.0-or-later.
 #include <atomic>
 #include <cmath>
 #include <cwchar>
+#include <new>
 
 #include <windhawk_utils.h>
 
@@ -389,6 +399,7 @@ struct Settings {
     bool removeIconBackground = true;
     bool hideMenuBorder = false;
     bool styleWindowMenu = false;
+    bool styleFileInfoTips = false;
     SelectionFade selectionFade = SelectionFade::Replay;
 };
 Settings
@@ -404,7 +415,7 @@ GetThemeClass_t g_getThemeClass = nullptr;
 decltype(&TrackPopupMenu) g_trackPopupMenu = nullptr;
 decltype(&TrackPopupMenuEx) g_trackPopupMenuEx = nullptr;
 decltype(&CreateWindowExW) g_createWindowEx = nullptr;
-SRWLOCK g_windowMenuSubclassLock = SRWLOCK_INIT;
+SRWLOCK g_surfaceSubclassLock = SRWLOCK_INIT;
 decltype(&DrawThemeBackground) g_drawThemeBackground = nullptr;
 decltype(&DrawThemeBackgroundEx) g_drawThemeBackgroundEx = nullptr;
 decltype(&DrawThemeText) g_drawThemeText = nullptr;
@@ -509,20 +520,13 @@ HighlightGeometry GetHighlightGeometry(int width, int height, UINT dpi) {
 
 enum class ReplayHighlightSpace { None, Screen, Item };
 
-// POD TLS only. In particular, nothing runs a destructor at process shutdown.
-struct SelectionReplay;
-struct Popup {
+struct Backdrop {
     HWND hwnd;
-    HMENU menu;
-    HBRUSH oldBrush;
-    HTHEME palette;
-    bool brushChanged;
     bool blurChanged;
     bool frameChanged;
     bool backdropChanged;
     bool cornerChanged;
     bool darkChanged;
-    bool active;
     bool dark;
     bool haveBackdrop;
     bool haveCorner;
@@ -537,6 +541,16 @@ struct Popup {
     bool haveAccent;
     bool accentChanged;
     bool applying;
+};
+
+// POD TLS only. In particular, nothing runs a destructor at process shutdown.
+struct SelectionReplay;
+struct Popup : Backdrop {
+    HMENU menu;
+    HBRUSH oldBrush;
+    HTHEME palette;
+    bool brushChanged;
+    bool active;
     bool subclassed;
     bool preparing;
     bool layingOut;
@@ -1086,7 +1100,43 @@ bool IsSupportedMenu(HMENU menu, HWND owner, bool* shellOwnerDraw = nullptr) {
     return true;
 }
 
-bool ApplyBackdrop(Popup& popup) {
+bool ReadBackdrop(Backdrop& backdrop) {
+    HWND hwnd = backdrop.hwnd;
+    backdrop.haveBackdrop = SUCCEEDED(DwmGetWindowAttribute(
+        hwnd, DWMWA_SYSTEMBACKDROP_TYPE, &backdrop.oldBackdrop,
+        sizeof(backdrop.oldBackdrop)));
+    if (!backdrop.haveBackdrop)
+        return false;
+    backdrop.haveCorner = SUCCEEDED(DwmGetWindowAttribute(
+        hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &backdrop.oldCorner,
+        sizeof(backdrop.oldCorner)));
+    backdrop.haveDark = SUCCEEDED(DwmGetWindowAttribute(
+        hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &backdrop.oldDark,
+        sizeof(backdrop.oldDark)));
+    if (g_settings.hideMenuBorder)
+        backdrop.haveBorderColor = SUCCEEDED(DwmGetWindowAttribute(
+            hwnd, DWMWA_BORDER_COLOR, &backdrop.oldBorderColor,
+            sizeof(backdrop.oldBorderColor)));
+    if (g_getComposition) {
+        CompositionData data{19, &backdrop.oldAccent, sizeof(backdrop.oldAccent)};
+        backdrop.haveAccent = g_getComposition(hwnd, &data) != FALSE;
+    }
+    return true;
+}
+
+bool EnableBackdropAlpha(Backdrop& backdrop) {
+    HRGN region = CreateRectRgn(0, 0, -1, -1);
+    if (!region)
+        return false;
+    DWM_BLURBEHIND blur{DWM_BB_ENABLE | DWM_BB_BLURREGION, TRUE, region, FALSE};
+    HRESULT result = DwmEnableBlurBehindWindow(backdrop.hwnd, &blur);
+    DeleteObject(region);
+    if (SUCCEEDED(result))
+        backdrop.blurChanged = true;
+    return SUCCEEDED(result);
+}
+
+bool ApplyBackdrop(Backdrop& popup) {
     if (popup.applying)
         return false;
     popup.applying = true;
@@ -1235,11 +1285,18 @@ bool ApplyBackdrop(Popup& popup) {
     return success;
 }
 
-bool HasPopupChanges(const Popup& popup) {
-    return popup.brushChanged || popup.blurChanged || popup.frameChanged ||
-           popup.accentChanged || popup.backdropChanged ||
-           popup.cornerChanged || popup.darkChanged || popup.borderColorChanged;
+bool HasBackdropChanges(const Backdrop& backdrop) {
+    return backdrop.blurChanged || backdrop.frameChanged ||
+           backdrop.accentChanged || backdrop.backdropChanged ||
+           backdrop.cornerChanged || backdrop.darkChanged ||
+           backdrop.borderColorChanged;
 }
+
+bool HasPopupChanges(const Popup& popup) {
+    return popup.brushChanged || HasBackdropChanges(popup);
+}
+
+void RestoreBackdrop(Backdrop& popup, bool destroying);
 
 void RestorePopup(Popup& popup, bool destroying = false) {
     DiscardSelectionReplay(popup.clickReplay);
@@ -1269,14 +1326,18 @@ void RestorePopup(Popup& popup, bool destroying = false) {
             }
         }
     }
+    RestoreBackdrop(popup, destroying);
+    ETM_LOG(L"Cleanup hwnd=%p menu=%p brushPending=%d", popup.hwnd, popup.menu,
+            popup.brushChanged);
+}
+
+void RestoreBackdrop(Backdrop& popup, bool destroying = false) {
     // Window-owned effects die with the HWND. Do not expose a native/bright
     // last frame by resetting attributes during WM_DESTROY/WM_NCDESTROY.
     if (destroying || !IsWindow(popup.hwnd)) {
         popup.blurChanged = popup.frameChanged = popup.accentChanged = false;
         popup.backdropChanged = popup.cornerChanged = popup.darkChanged = false;
         popup.borderColorChanged = false;
-        ETM_LOG(L"Cleanup hwnd=%p menu=%p window-destroyed", popup.hwnd,
-                popup.menu);
         return;
     }
     if (popup.accentChanged && g_setComposition) {
@@ -1341,10 +1402,10 @@ void RestorePopup(Popup& popup, bool destroying = false) {
             popup.hwnd, border, result, popup.haveBorderColor);
     }
     ETM_LOG(
-        L"Cleanup hwnd=%p menu=%p pending brush=%d blur=%d frame=%d accent=%d "
+        L"Backdrop cleanup hwnd=%p pending blur=%d frame=%d accent=%d "
         L"backdrop=%d corner=%d dark=%d border=%d",
-        popup.hwnd, popup.menu, popup.brushChanged, popup.blurChanged,
-        popup.frameChanged, popup.accentChanged, popup.backdropChanged,
+        popup.hwnd, popup.blurChanged, popup.frameChanged,
+        popup.accentChanged, popup.backdropChanged,
         popup.cornerChanged, popup.darkChanged, popup.borderColorChanged);
 }
 
@@ -1578,27 +1639,10 @@ struct MenuScope {
             L"Preparing hwnd=%p menu=%p material=%s theme=%s shellOwnerDraw=%d",
             hwnd, popup.menu, MaterialName(g_settings.material),
             popup.dark ? L"dark" : L"light", shellOwnerDraw);
-        popup.haveBackdrop = SUCCEEDED(DwmGetWindowAttribute(
-            hwnd, DWMWA_SYSTEMBACKDROP_TYPE, &popup.oldBackdrop,
-            sizeof(popup.oldBackdrop)));
-        if (!popup.haveBackdrop) {
+        if (!ReadBackdrop(popup)) {
             ETM_LOG(L"Native fallback hwnd=%p: previous backdrop is unreadable",
                     hwnd);
             return;
-        }
-        popup.haveCorner = SUCCEEDED(
-            DwmGetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE,
-                                  &popup.oldCorner, sizeof(popup.oldCorner)));
-        popup.haveDark = SUCCEEDED(
-            DwmGetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE,
-                                  &popup.oldDark, sizeof(popup.oldDark)));
-        if (g_settings.hideMenuBorder)
-            popup.haveBorderColor = SUCCEEDED(DwmGetWindowAttribute(
-                hwnd, DWMWA_BORDER_COLOR, &popup.oldBorderColor,
-                sizeof(popup.oldBorderColor)));
-        if (g_getComposition) {
-            CompositionData data{19, &popup.oldAccent, sizeof(popup.oldAccent)};
-            popup.haveAccent = g_getComposition(hwnd, &data) != FALSE;
         }
         popup.palette =
             OpenThemeData(hwnd, popup.dark ? L"DarkMode::Menu" : L"Menu");
@@ -1606,15 +1650,6 @@ struct MenuScope {
             DWORD error = GetLastError();
             ETM_LOG(
                 L"Preparation failed hwnd=%p stage=OpenThemeData lastError=%lu",
-                hwnd, error);
-            RestorePopup(popup);
-            return;
-        }
-        HRGN region = CreateRectRgn(0, 0, -1, -1);
-        if (!region) {
-            DWORD error = GetLastError();
-            ETM_LOG(
-                L"Preparation failed hwnd=%p stage=CreateRectRgn lastError=%lu",
                 hwnd, error);
             RestorePopup(popup);
             return;
@@ -1628,23 +1663,13 @@ struct MenuScope {
                 ETM_LOG(
                     L"Preparation failed hwnd=%p stage=SetMenuInfo lastError=%lu",
                     hwnd, error);
-                DeleteObject(region);
                 RestorePopup(popup);
                 return;
             }
             popup.brushChanged = true;
         }
-        DWM_BLURBEHIND blur{DWM_BB_ENABLE | DWM_BB_BLURREGION, TRUE, region,
-                            FALSE};
-        HRESULT result = DwmEnableBlurBehindWindow(hwnd, &blur);
-        DeleteObject(region);
-        if (SUCCEEDED(result))
-            popup.blurChanged = true;
-        if (FAILED(result)) {
-            ETM_LOG(
-                L"Preparation failed hwnd=%p stage=DwmEnableBlurBehindWindow "
-                L"hr=0x%08lx",
-                hwnd, result);
+        if (!EnableBackdropAlpha(popup)) {
+            ETM_LOG(L"Preparation failed hwnd=%p stage=backdrop alpha", hwnd);
             RestorePopup(popup);
             return;
         }
@@ -2320,17 +2345,71 @@ bool ClearBackground(HTHEME theme,
                   area.bottom - area.top, BLACKNESS) != FALSE;
 }
 
+struct InfoTipPaint {
+    HWND hwnd;
+    HDC printDC;
+    HTHEME theme;
+    bool dark;
+};
+thread_local const InfoTipPaint* t_infoTipPaint = nullptr;
+
+const InfoTipPaint* InfoTipPaintForDC(HDC dc) {
+    const auto* paint = t_infoTipPaint;
+    return paint && !g_stopping.load(std::memory_order_relaxed) &&
+                   (paint->printDC ? paint->printDC == dc
+                                   : WindowFromDC(dc) == paint->hwnd)
+               ? paint : nullptr;
+}
+
+bool PaintInfoTipBackground(HTHEME theme, HDC dc, int part, int state,
+                            const RECT* rect, const RECT* clip) {
+    if (!rect || IsRectEmpty(rect) || part != TTP_STANDARD)
+        return false;
+    const auto* paint = InfoTipPaintForDC(dc);
+    if (!paint || theme != paint->theme)
+        return false;
+    RECT area = *rect;
+    if (!g_settings.hideMenuBorder) {
+        // The standard tooltip theme is an image with a one-pixel outline.
+        // DTBG_OMITCONTENT still draws its opaque center. Keep only the edge.
+        InflateRect(&area, -1, -1);
+        if (IsRectEmpty(&area))
+            return false;
+        int saved = SaveDC(dc);
+        if (!saved)
+            return false;
+        bool clipped = (!clip || IntersectClipRect(dc, clip->left, clip->top,
+                                                    clip->right, clip->bottom) != ERROR) &&
+                       ExcludeClipRect(dc, area.left, area.top, area.right,
+                                       area.bottom) != ERROR;
+        t_infoTipPaint = nullptr;
+        HRESULT result = clipped
+            ? g_drawThemeBackgroundEx(theme, dc, part, state, rect, nullptr)
+            : E_FAIL;
+        t_infoTipPaint = paint;
+        RestoreDC(dc, saved);
+        if (FAILED(result))
+            return false;
+    }
+    if (clip && !IntersectRect(&area, &area, clip))
+        return true;
+    return PatBlt(dc, area.left, area.top, area.right - area.left,
+                  area.bottom - area.top, BLACKNESS) != FALSE;
+}
+
 HRESULT WINAPI DrawThemeBackgroundHook(HTHEME theme,
                                        HDC dc,
                                        int part,
                                        int state,
                                        const RECT* rect,
                                        const RECT* clip) {
-    if (!t_scope) {
+    if (!t_scope && !t_infoTipPaint) {
         [[clang::musttail]] return g_drawThemeBackground(theme, dc, part, state,
                                                          rect, clip);
     }
     CallGuard call;
+    if (t_infoTipPaint && PaintInfoTipBackground(theme, dc, part, state, rect, clip))
+        return S_OK;
     if (PaintHotItem(theme, dc, part, state, rect, clip))
         return S_OK;
     if (ClearBackground(theme, dc, part, state, rect, clip))
@@ -2348,11 +2427,16 @@ HRESULT WINAPI DrawThemeBackgroundExHook(HTHEME theme,
                                          int state,
                                          const RECT* rect,
                                          const DTBGOPTS* opts) {
-    if (!t_scope) {
+    if (!t_scope && !t_infoTipPaint) {
         [[clang::musttail]] return g_drawThemeBackgroundEx(theme, dc, part,
                                                            state, rect, opts);
     }
     CallGuard call;
+    if (t_infoTipPaint && (!opts || (opts->dwSize == sizeof(*opts) &&
+                                   !(opts->dwFlags & ~DTBG_CLIPRECT))) &&
+        PaintInfoTipBackground(theme, dc, part, state, rect,
+            opts && (opts->dwFlags & DTBG_CLIPRECT) ? &opts->rcClip : nullptr))
+        return S_OK;
     // Preserve uncommon omit-border/content and mirrored drawing options.
     if ((!opts || (opts->dwSize == sizeof(*opts) &&
                    !(opts->dwFlags & ~DTBG_CLIPRECT))) &&
@@ -2805,19 +2889,36 @@ int WINAPI FillRectHook(HDC dc, const RECT* rect, HBRUSH brush) {
 
 int WINAPI
 DrawTextHook(HDC dc, PCWSTR text, int length, RECT* rect, UINT flags) {
-    if (!t_scope) {
+    if (!t_scope && !t_infoTipPaint) {
         [[clang::musttail]] return g_drawText(dc, text, length, rect, flags);
     }
     CallGuard call;
-    Popup* popup =
-        !t_textDepth && rect && !IsRectEmpty(rect) &&
-                !(flags & (DT_CALCRECT | DT_MODIFYSTRING | DT_INTERNAL)) &&
-                t_scope && t_scope->drawingItem &&
-                t_scope->drawingItem->hDC == dc
-            ? DrawingPopupForDC(dc)
-            : nullptr;
-    if (!popup)
+    if (t_textDepth || !rect || IsRectEmpty(rect) ||
+        (flags & (DT_CALCRECT | DT_MODIFYSTRING | DT_INTERNAL)))
         return g_drawText(dc, text, length, rect, flags);
+
+    HTHEME theme;
+    int part, state;
+    COLORREF color;
+    if (const auto* paint = InfoTipPaintForDC(dc)) {
+        theme = paint->theme;
+        part = TTP_STANDARD;
+        state = TTSS_NORMAL;
+        color = paint->dark ? RGB(245, 245, 245) : RGB(25, 25, 25);
+    } else {
+        Popup* popup = t_scope && t_scope->drawingItem &&
+                               t_scope->drawingItem->hDC == dc
+                           ? DrawingPopupForDC(dc) : nullptr;
+        if (!popup)
+            return g_drawText(dc, text, length, rect, flags);
+        bool disabled = t_scope->drawingItem->itemState & (ODS_DISABLED | ODS_GRAYED);
+        theme = popup->palette;
+        part = MENU_POPUPITEM;
+        state = disabled ? MPI_DISABLED : MPI_NORMAL;
+        color = popup->dark
+                    ? (disabled ? RGB(155, 155, 155) : RGB(245, 245, 245))
+                    : (disabled ? RGB(120, 120, 120) : RGB(25, 25, 25));
+    }
 
     TextGuard textGuard;
     BP_PAINTPARAMS params{sizeof(params)};
@@ -2832,11 +2933,6 @@ DrawTextHook(HDC dc, PCWSTR text, int length, RECT* rect, UINT flags) {
     if (HGDIOBJ font = GetCurrentObject(dc, OBJ_FONT))
         SelectObject(bufferDC, font);
     SetBkMode(bufferDC, TRANSPARENT);
-    bool disabled =
-        t_scope->drawingItem->itemState & (ODS_DISABLED | ODS_GRAYED);
-    COLORREF color = popup->dark
-                         ? (disabled ? RGB(155, 155, 155) : RGB(245, 245, 245))
-                         : (disabled ? RGB(120, 120, 120) : RGB(25, 25, 25));
     SetTextColor(bufferDC, color);
     int height = 0;
     DTTOPTS opts{sizeof(opts)};
@@ -2851,9 +2947,8 @@ DrawTextHook(HDC dc, PCWSTR text, int length, RECT* rect, UINT flags) {
         return result;
     };
     RECT bounds = *rect;
-    HRESULT result = g_drawThemeTextEx(popup->palette, bufferDC, MENU_POPUPITEM,
-                                       disabled ? MPI_DISABLED : MPI_NORMAL,
-                                       text, length, flags, &bounds, &opts);
+    HRESULT result = g_drawThemeTextEx(theme, bufferDC, part, state, text,
+                                       length, flags, &bounds, &opts);
     HRESULT end = EndBufferedPaint(buffer, SUCCEEDED(result));
     if (FAILED(result) || FAILED(end))
         return g_drawText(dc, text, length, rect, flags);
@@ -3031,13 +3126,183 @@ LRESULT CALLBACK WindowMenuOwnerSubclass(HWND hwnd, UINT message, WPARAM wParam,
 
 constexpr PCWSTR kExplorerWindowClass = L"CabinetWClass";
 
-bool IsWindowMenuOwner(HWND hwnd) {
-    DWORD pid = 0;
-    if (!GetWindowThreadProcessId(hwnd, &pid) || pid != GetCurrentProcessId())
-        return false;
+bool WindowClassIs(HWND hwnd, PCWSTR expected) {
     wchar_t name[32];
-    return GetClassNameW(hwnd, name, ARRAYSIZE(name)) &&
-           wcscmp(name, kExplorerWindowClass) == 0;
+    return hwnd && GetClassNameW(hwnd, name, ARRAYSIZE(name)) &&
+           _wcsicmp(name, expected) == 0;
+}
+
+bool IsLocalWindow(HWND hwnd) {
+    DWORD pid = 0;
+    return GetWindowThreadProcessId(hwnd, &pid) && pid == GetCurrentProcessId();
+}
+
+bool IsWindowMenuOwner(HWND hwnd) {
+    return IsLocalWindow(hwnd) && WindowClassIs(hwnd, kExplorerWindowClass);
+}
+
+constexpr PCWSTR kInfoTipStateProperty = L"ExplorerTranslucentMenus.InfoTipState";
+UINT g_detachInfoTipMessage;
+
+HWND InfoTipFileView(HWND hwnd, bool& noCurrentTool) {
+    HWND owner = GetWindow(hwnd, GW_OWNER);
+    if (!IsWindowMenuOwner(owner) || (GetWindowLongPtrW(hwnd, GWL_STYLE) & TTS_BALLOON))
+        return nullptr;
+    TOOLINFOW tool{sizeof(tool)};
+    if (!SendMessageW(hwnd, TTM_GETCURRENTTOOLW, 0, reinterpret_cast<LPARAM>(&tool))) {
+        noCurrentTool = true;
+        return nullptr;
+    }
+    HWND target = (tool.uFlags & TTF_IDISHWND)
+        ? reinterpret_cast<HWND>(tool.uId) : tool.hwnd;
+    if (!WindowClassIs(target, L"DirectUIHWND") ||
+        !WindowClassIs(GetAncestor(target, GA_PARENT), L"SHELLDLL_DefView") ||
+        GetAncestor(target, GA_ROOT) != owner ||
+        GetWindowThreadProcessId(target, nullptr) != GetCurrentThreadId())
+        return nullptr;
+    return target;
+}
+
+struct InfoTipState {
+    Backdrop backdrop{};
+    HWND source = nullptr;
+    unsigned calls = 0;
+    bool busy = false;
+    bool styled = false;
+    bool buffered = false;
+    bool detached = false;
+    bool destroying = false;
+
+    void Reset() {
+        styled = false;
+        source = nullptr;
+        busy = true;
+        if (HasBackdropChanges(backdrop))
+            RestoreBackdrop(backdrop, destroying);
+        if (buffered) {
+            BufferedPaintUnInit();
+            buffered = false;
+        }
+        busy = false;
+    }
+};
+
+struct InfoTipCall {
+    InfoTipState& state;
+    explicit InfoTipCall(InfoTipState& s) : state(s) { ++state.calls; }
+    ~InfoTipCall() {
+        if (!--state.calls && state.detached) {
+            SelectionReplayErrorGuard errorGuard;
+            state.Reset();
+            delete &state;
+        }
+    }
+};
+
+LRESULT CALLBACK InfoTipSubclass(HWND hwnd, UINT message, WPARAM wp, LPARAM lp,
+                                  DWORD_PTR) {
+    CallGuard call;
+    const bool detach = message == g_detachInfoTipMessage || message == WM_NCDESTROY;
+    const auto* pos = (message == WM_WINDOWPOSCHANGING ||
+                       message == WM_WINDOWPOSCHANGED)
+        ? reinterpret_cast<const WINDOWPOS*>(lp) : nullptr;
+    const bool show = pos && message == WM_WINDOWPOSCHANGING &&
+                      (pos->flags & SWP_SHOWWINDOW);
+    const bool hide = pos && message == WM_WINDOWPOSCHANGED &&
+                      (pos->flags & SWP_HIDEWINDOW);
+    const bool paint = message == WM_PAINT || message == WM_PRINTCLIENT ||
+                       (message == WM_PRINT && (lp & PRF_CLIENT));
+    if (!detach && !show && !hide && !paint)
+        return DefSubclassProc(hwnd, message, wp, lp);
+
+    DWORD incoming = GetLastError();
+    const InfoTipPaint* previousPaint = t_infoTipPaint;
+    if (paint)
+        t_infoTipPaint = nullptr;
+    auto* state = static_cast<InfoTipState*>(GetPropW(hwnd, kInfoTipStateProperty));
+    HWND source = nullptr;
+    if (!detach && !hide && (!state || !state->busy) &&
+        !g_stopping.load(std::memory_order_relaxed)) {
+        bool noCurrentTool = false;
+        source = InfoTipFileView(hwnd, noCurrentTool);
+        // Querying a control sends a synchronous message. Read the property
+        // again in case that dispatch detached the subclass.
+        auto* current = static_cast<InfoTipState*>(GetPropW(hwnd, kInfoTipStateProperty));
+        if (state && !current)
+            source = nullptr;
+        // comctl32 clears its current tool before the fade-out timer hides
+        // the HWND. Repainting that last frame must not drop its backdrop.
+        else if (paint && current && current->styled && noCurrentTool &&
+                 IsWindowVisible(hwnd))
+            source = current->source;
+        state = current;
+    }
+    if (!state && source && !g_stopping.load(std::memory_order_relaxed)) {
+        state = new (std::nothrow) InfoTipState;
+        if (state && !SetPropW(hwnd, kInfoTipStateProperty, state)) {
+            delete state;
+            state = nullptr;
+        }
+    }
+    if (!state) {
+        SetLastError(incoming);
+        LRESULT result = DefSubclassProc(hwnd, message, wp, lp);
+        t_infoTipPaint = previousPaint;
+        return result;
+    }
+    InfoTipCall lifetime(*state);
+    if (detach) {
+        RemovePropW(hwnd, kInfoTipStateProperty);
+        state->styled = false;
+        state->detached = true;
+        state->destroying = message == WM_NCDESTROY;
+        if (!state->destroying && IsWindowVisible(hwnd))
+            InvalidateRect(hwnd, nullptr, TRUE);
+    } else if (!hide && !state->busy && state->source != source) {
+        state->Reset();
+        state->source = source;
+        if (!state->detached && source && !HasBackdropChanges(state->backdrop) &&
+            GetWindowTheme(hwnd) && EffectsAllowed()) {
+            state->busy = true;
+            auto& backdrop = state->backdrop;
+            backdrop = {};
+            backdrop.hwnd = hwnd;
+            backdrop.dark = UsesDarkMenus();
+            state->buffered = SUCCEEDED(BufferedPaintInit());
+            state->styled = state->buffered && ReadBackdrop(backdrop) &&
+                EnableBackdropAlpha(backdrop) && ApplyBackdrop(backdrop) &&
+                !state->detached;
+            state->busy = false;
+            if (state->styled) {
+                ETM_LOG(L"File InfoTip hwnd=%p view=%p material=%s", hwnd, source,
+                        MaterialName(g_settings.material));
+            } else {
+                state->Reset();
+                state->source = source;  // Keep this presentation native.
+            }
+        }
+    }
+
+    InfoTipPaint target{};
+    if (paint && source && state->styled && !state->busy) {
+        target = {hwnd, reinterpret_cast<HDC>(wp), GetWindowTheme(hwnd),
+                  state->backdrop.dark};
+        if (target.theme)
+            t_infoTipPaint = &target;
+    }
+    SetLastError(incoming);
+    LRESULT result = DefSubclassProc(hwnd, message, wp, lp);
+    t_infoTipPaint = previousPaint;
+    if (hide && !state->busy && !state->detached) {
+        SelectionReplayErrorGuard errorGuard;
+        state->Reset();
+    }
+    return result;
+}
+
+void AttachInfoTip(HWND hwnd) {
+    if (IsWindowMenuOwner(GetWindow(hwnd, GW_OWNER)))
+        WindhawkUtils::SetWindowSubclassFromAnyThread(hwnd, InfoTipSubclass, 0);
 }
 
 void AttachWindowMenuOwner(HWND hwnd) {
@@ -3046,13 +3311,23 @@ void AttachWindowMenuOwner(HWND hwnd) {
     ETM_LOG(L"Title bar menu owner=%p subclassed=%d", hwnd, attached);
 }
 
-BOOL CALLBACK VisitWindowMenuOwner(HWND hwnd, LPARAM attach) {
-    if (IsWindowMenuOwner(hwnd)) {
+BOOL CALLBACK VisitExplorerSurfaces(HWND hwnd, LPARAM attach) {
+    if (g_settings.styleWindowMenu && IsWindowMenuOwner(hwnd)) {
         if (attach)
             AttachWindowMenuOwner(hwnd);
         else
             WindhawkUtils::RemoveWindowSubclassFromAnyThread(
                 hwnd, WindowMenuOwnerSubclass);
+    }
+    if (g_settings.styleFileInfoTips && IsLocalWindow(hwnd) &&
+        WindowClassIs(hwnd, TOOLTIPS_CLASSW)) {
+        if (attach) {
+            AttachInfoTip(hwnd);
+        } else {
+            if (GetPropW(hwnd, kInfoTipStateProperty))
+                SendMessageW(hwnd, g_detachInfoTipMessage, 0, 0);
+            WindhawkUtils::RemoveWindowSubclassFromAnyThread(hwnd, InfoTipSubclass);
+        }
     }
     return TRUE;
 }
@@ -3063,7 +3338,10 @@ HWND WINAPI CreateWindowExWHook(DWORD exStyle, PCWSTR className,
                                 HINSTANCE instance, LPVOID param) {
     if ((style & WS_CHILD) || !className ||
         (!IS_INTRESOURCE(className) &&
-         _wcsicmp(className, kExplorerWindowClass) != 0)) {
+         !(g_settings.styleWindowMenu &&
+           _wcsicmp(className, kExplorerWindowClass) == 0) &&
+         !(g_settings.styleFileInfoTips &&
+           _wcsicmp(className, TOOLTIPS_CLASSW) == 0))) {
         [[clang::musttail]] return g_createWindowEx(
             exStyle, className, windowName, style, x, y, width, height, parent,
             menu, instance, param);
@@ -3072,12 +3350,16 @@ HWND WINAPI CreateWindowExWHook(DWORD exStyle, PCWSTR className,
     HWND hwnd = g_createWindowEx(exStyle, className, windowName, style, x, y,
                                 width, height, parent, menu, instance, param);
     DWORD error = GetLastError();
-    if (hwnd && IsWindowMenuOwner(hwnd)) {
+    if (hwnd) {
         // The new window is on this thread; no cross-thread send under the lock.
-        AcquireSRWLockShared(&g_windowMenuSubclassLock);
-        if (!g_stopping.load(std::memory_order_relaxed))
-            AttachWindowMenuOwner(hwnd);
-        ReleaseSRWLockShared(&g_windowMenuSubclassLock);
+        AcquireSRWLockShared(&g_surfaceSubclassLock);
+        if (!g_stopping.load(std::memory_order_relaxed)) {
+            if (g_settings.styleWindowMenu && IsWindowMenuOwner(hwnd))
+                AttachWindowMenuOwner(hwnd);
+            else if (g_settings.styleFileInfoTips && WindowClassIs(hwnd, TOOLTIPS_CLASSW))
+                AttachInfoTip(hwnd);
+        }
+        ReleaseSRWLockShared(&g_surfaceSubclassLock);
     }
     SetLastError(error);
     return hwnd;
@@ -3157,6 +3439,13 @@ BOOL Wh_ModInit() {
     g_settings.roundedCorners = Wh_GetIntSetting(L"roundedCorners") != 0;
     g_settings.hideMenuBorder = Wh_GetIntSetting(L"hideMenuBorder") != 0;
     g_settings.styleWindowMenu = Wh_GetIntSetting(L"styleWindowMenu") != 0;
+    g_settings.styleFileInfoTips = Wh_GetIntSetting(L"styleFileInfoTips") != 0;
+    if (g_settings.styleFileInfoTips) {
+        g_detachInfoTipMessage =
+            RegisterWindowMessageW(L"ExplorerTranslucentMenus.DetachInfoTip." WH_MOD_ID);
+        if (!g_detachInfoTipMessage)
+            return FALSE;
+    }
     g_settings.ctrlBypass = Wh_GetIntSetting(L"ctrlBypass") != 0;
     g_stopping.store(false, std::memory_order_relaxed);
 
@@ -3187,25 +3476,25 @@ BOOL Wh_ModInit() {
                                         DwmSetWindowAttributeHook,
                                         &g_dwmSetWindowAttribute))
         return FALSE;
-    if (g_settings.styleWindowMenu &&
+    if ((g_settings.styleWindowMenu || g_settings.styleFileInfoTips) &&
         !WindhawkUtils::SetFunctionHook(CreateWindowExW, CreateWindowExWHook,
                                         &g_createWindowEx))
         return FALSE;
-    ETM_LOG(L"Initialized on Windows build %lu material=%s titleBarMenu=%d",
+    ETM_LOG(L"Initialized on Windows build %lu material=%s titleBarMenu=%d fileInfoTips=%d",
             version.dwBuildNumber, MaterialName(g_settings.material),
-            g_settings.styleWindowMenu);
+            g_settings.styleWindowMenu, g_settings.styleFileInfoTips);
     return TRUE;
 }
 
 void Wh_ModAfterInit() {
     if (etm::g_createWindowEx)
-        EnumWindows(etm::VisitWindowMenuOwner, TRUE);
+        EnumWindows(etm::VisitExplorerSurfaces, TRUE);
 }
 
 void Wh_ModBeforeUninit() {
-    AcquireSRWLockExclusive(&etm::g_windowMenuSubclassLock);
+    AcquireSRWLockExclusive(&etm::g_surfaceSubclassLock);
     etm::g_stopping.store(true, std::memory_order_relaxed);
-    ReleaseSRWLockExclusive(&etm::g_windowMenuSubclassLock);
+    ReleaseSRWLockExclusive(&etm::g_surfaceSubclassLock);
     etm::StopSelectionReplays();
     // Cancel active loops on their owning UI threads before removing the
     // owner observers. Do not hold the scope lock across subclass removal.
@@ -3217,7 +3506,7 @@ void Wh_ModBeforeUninit() {
     }
     ReleaseSRWLockShared(&etm::g_scopesLock);
     if (etm::g_createWindowEx)
-        EnumWindows(etm::VisitWindowMenuOwner, FALSE);
+        EnumWindows(etm::VisitExplorerSurfaces, FALSE);
 }
 
 void Wh_ModUninit() {
