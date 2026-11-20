@@ -1308,7 +1308,7 @@ void CheckHighlightGeometry(HWND) {
     for (int i = 0; i < width * height; ++i)
         transparent = transparent && (pixels[i] >> 24) == 0;
     Check(transparent, "an inset consuming the row produces no highlight");
-    auto centerPixel = [&] { return pixels[(height / 2) * width + width / 2]; };
+    auto centerPixel = [&]() -> DWORD& { return pixels[(height / 2) * width + width / 2]; };
     COLORREF savedColor = etm::g_settings.highlightColor;
     bool savedDark = popup->dark;
     popup->dark = false;
@@ -1325,6 +1325,45 @@ void CheckHighlightGeometry(HWND) {
     etm::g_settings.highlightColor = etm::ParseRgbColor(L"#000000", CLR_INVALID);
     Check(draw(4, 0) && centerPixel() == 0xcc000000,
           "black is a valid custom highlight, not the default");
+
+    // Exercise the selected-item paint used by native menus during an offscreen
+    // draw, without depending on Windows choosing to animate this opening.
+    UINT itemId = GetMenuItemID(popup->menu, 0);
+    DRAWITEMSTRUCT item{ODT_MENU, 0, itemId, ODA_DRAWENTIRE, ODS_SELECTED,
+                        reinterpret_cast<HWND>(popup->menu), image.dc, row};
+    const etm::UahPaintTarget paint{popup->hwnd, image.dc, &item};
+    const auto* previousPaint = scope->uahPaint;
+    scope->uahPaint = &paint;
+    auto savedFade = etm::g_settings.selectionFade;
+    etm::g_settings.selectionFade = etm::SelectionFade::Replay;
+    RECT hot{3, 2, width - 5, height - 3};
+    RECT screenRow = row;
+    RECT expected = hot;
+    OffsetRect(&screenRow, 250, 300);
+    OffsetRect(&expected, 250, 300);
+    RECT resolved{};
+    HRESULT result = DrawThemeBackground(popup->palette, image.dc,
+        etm::kPopupItemFocusable, MPI_HOT, &hot, nullptr);
+    Check(SUCCEEDED(result) &&
+          etm::ResolveReplayHighlight(*popup, screenRow, itemId, resolved) &&
+          EqualRect(&resolved, &expected),
+          "native offscreen highlight resolves to the item-relative replay crop");
+    popup->replayHighlightSpace = etm::ReplayHighlightSpace::None;
+    etm::g_settings.selectionFade = savedFade;
+
+    bool savedBorder = etm::g_settings.hideMenuBorder;
+    for (bool hide : {false, true}) {
+        etm::g_settings.hideMenuBorder = hide;
+        GdiFlush();
+        centerPixel() = 0x7f112233;
+        bool cleared = etm::ClearBackground(popup->palette, image.dc,
+            MENU_POPUPBORDERS, 0, &row, nullptr);
+        GdiFlush();
+        Check(cleared == hide && centerPixel() == (hide ? 0 : 0x7f112233),
+              "theme border clearing respects the hide border setting on a scoped DC");
+    }
+    etm::g_settings.hideMenuBorder = savedBorder;
+    scope->uahPaint = previousPaint;
     popup->dark = savedDark;
     etm::g_settings.highlightColor = savedColor;
     etm::g_settings.highlightRadius = savedRadius;
@@ -1574,8 +1613,11 @@ void ShowTestMenu(HWND owner, HMENU menu, bool active, bool select = false, bool
     }
 }
 
+bool scrollMenuSampled;
+
 void CALLBACK SampleScrollMenu(HWND owner, UINT, UINT_PTR timer, DWORD) {
     KillTimer(owner, timer);
+    scrollMenuSampled = true;
     HWND popup = nullptr;
     EnumThreadWindows(GetCurrentThreadId(), [](HWND hwnd, LPARAM param) -> BOOL {
         if (!IsWindowVisible(hwnd) || !etm::IsClassicPopup(hwnd))
@@ -1645,6 +1687,7 @@ void CheckScrollMenu(HWND owner) {
     SetCursorPos(away.x, away.y);
     for (bool hide : {false, true}) {
         etm::g_settings.hideMenuBorder = hide;
+        scrollMenuSampled = false;
         UINT_PTR timer = SetTimer(owner, 3, 650, SampleScrollMenu);
         if (!timer) {
             Check(false, "scrollbar menu sampling timer created");
@@ -1654,6 +1697,7 @@ void CheckScrollMenu(HWND owner) {
         SendMessageW(scroll, WM_CONTEXTMENU, reinterpret_cast<WPARAM>(scroll),
                      MAKELPARAM(anchor.x, anchor.y));
         KillTimer(owner, timer);
+        Check(scrollMenuSampled, "scrollbar menu stayed open for pixel sampling");
     }
     SetCursorPos(cursor.x, cursor.y);
     DestroyWindow(scroll);

@@ -63,6 +63,8 @@ preserves menu dimensions and works with rounded or square corners. Native
 mode and Ctrl bypass retain the complete Windows appearance.
 The option also protects the outline setting from later Shell/UxTheme updates
 while the modified menu is being tracked.
+When disabled, the theme draws the native border both during the opening
+animation and on later repaints.
 
 Enable **Apply material to title bar menu** to also style File Explorer's
 window menu, opened by right-clicking the title bar or pressing `Alt+Space`.
@@ -81,9 +83,10 @@ Opening animations and keyboard command activation remain native.
 | Recreate fade animation (default) | Fade a snapshot of the fully composited item for 350 ms |
 
 Replay captures the visible hover appearance before the pressed-state paint,
-including the material, text, and icons. Its non-interactive overlay runs on a
-separate thread. Menu command delivery does not wait for it to show the
-overlay or finish the fade.
+including the material, text, and icons. The fade is clipped to the custom
+highlight even when Windows drew the item offscreen. The non-interactive
+overlay runs on a separate thread, so menu command delivery does not wait
+for it to show or finish the fade.
 It respects Windows' selection-fade and UI-effects settings and never changes
 global animation preferences.
 

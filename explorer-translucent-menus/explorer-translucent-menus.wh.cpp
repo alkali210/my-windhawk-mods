@@ -89,6 +89,8 @@ preserves menu dimensions and works with rounded or square corners. Native
 mode and Ctrl bypass retain the complete Windows appearance.
 The option also protects the outline setting from later Shell/UxTheme updates
 while the modified menu is being tracked.
+When disabled, the theme draws the native border both during the opening
+animation and on later repaints.
 
 Enable **Apply material to title bar menu** to also style File Explorer's
 window menu, opened by right-clicking the title bar or pressing `Alt+Space`.
@@ -107,9 +109,10 @@ Opening animations and keyboard command activation remain native.
 | Recreate fade animation (default) | Fade a snapshot of the fully composited item for 350 ms |
 
 Replay captures the visible hover appearance before the pressed-state paint,
-including the material, text, and icons. Its non-interactive overlay runs on a
-separate thread. Menu command delivery does not wait for it to show the
-overlay or finish the fade.
+including the material, text, and icons. The fade is clipped to the custom
+highlight even when Windows drew the item offscreen. The non-interactive
+overlay runs on a separate thread, so menu command delivery does not wait
+for it to show or finish the fade.
 It respects Windows' selection-fade and UI-effects settings and never changes
 global animation preferences.
 
@@ -2074,6 +2077,20 @@ LRESULT CALLBACK MenuOwnerSubclass(HWND hwnd,
     return DefSubclassProc(hwnd, message, wParam, lParam);
 }
 
+bool MatchPaintTarget(const MenuScope& scope, HDC dc, HWND& hwnd,
+                      const DRAWITEMSTRUCT*& item) {
+    if (scope.drawingItem && scope.drawingItem->hDC == dc) {
+        hwnd = scope.paintingWindow;
+        item = scope.drawingItem;
+    } else if (scope.uahPaint && scope.uahPaint->dc == dc) {
+        hwnd = scope.uahPaint->hwnd;
+        item = scope.uahPaint->item;
+    } else {
+        return false;
+    }
+    return true;
+}
+
 // Require a positive DC association, never the last observed popup. A memory
 // DC must match the exact synchronous Shell or native popup drawing target.
 Popup* DrawingPopupForDC(HDC dc) {
@@ -2081,11 +2098,8 @@ Popup* DrawingPopupForDC(HDC dc) {
     if (!scope || !scope->allowed || g_stopping.load(std::memory_order_relaxed))
         return nullptr;
     HWND hwnd;
-    if (scope->drawingItem && dc == scope->drawingItem->hDC)
-        hwnd = scope->paintingWindow;
-    else if (scope->uahPaint && dc == scope->uahPaint->dc)
-        hwnd = scope->uahPaint->hwnd;
-    else
+    const DRAWITEMSTRUCT* item;
+    if (!MatchPaintTarget(*scope, dc, hwnd, item))
         hwnd = WindowFromDC(dc);
     if (!hwnd || !IsClassicPopup(hwnd))
         return nullptr;
@@ -2143,12 +2157,10 @@ void RememberReplayHighlight(Popup& popup, HDC dc, const RECT& rect) {
     }
     // A verified drawing DC may belong to the owner or be a memory DC.
     // Remember its bounds relative to the item until its screen rect is known.
-    if (!t_scope)
-        return;
-    const UahPaintTarget* uah = t_scope->windowMenu ? t_scope->uahPaint : nullptr;
-    const DRAWITEMSTRUCT* item = uah ? uah->item : t_scope->drawingItem;
-    HWND hwnd = uah ? uah->hwnd : t_scope->paintingWindow;
-    if (!item || hwnd != popup.hwnd || item->hDC != dc ||
+    const DRAWITEMSTRUCT* item;
+    HWND hwnd;
+    if (!t_scope || !MatchPaintTarget(*t_scope, dc, hwnd, item) ||
+        hwnd != popup.hwnd || !item ||
         item->CtlType != ODT_MENU || !(item->itemState & ODS_SELECTED) ||
         reinterpret_cast<HMENU>(item->hwndItem) != popup.menu)
         return;
@@ -2282,8 +2294,11 @@ bool ClearBackground(HTHEME theme,
         return false;
     switch (part) {
         case MENU_POPUPBACKGROUND:
-        case MENU_POPUPBORDERS:
         case MENU_POPUPGUTTER:
+            break;
+        case MENU_POPUPBORDERS:
+            if (!g_settings.hideMenuBorder)
+                return false;
             break;
         case MENU_POPUPITEM:
         case kPopupItemFocusable:
