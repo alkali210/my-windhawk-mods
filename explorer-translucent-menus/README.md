@@ -73,7 +73,8 @@ corner, highlight, and mouse click animation settings as context menus.
 Opening animations and keyboard command activation remain native.
 
 Enable **Apply material to file information tooltips** to give File Explorer's
-file-list InfoTips the same material, tint, theme, corners, and border setting.
+file-list and desktop icon InfoTips the same material, tint, theme, corners,
+and border setting.
 The option is off by default. Windows still supplies the text, layout, hover
 delay, and animations. A tooltip keeps its material through the native fade-out.
 Navigation, toolbar, and taskbar tooltips are unchanged.
@@ -175,8 +176,10 @@ when enabled. Look for `Title bar menu` owner, entry, and system-menu lines,
 followed by the material result. With Windhawk logging disabled, these lines
 are not emitted even if the mod is loaded.
 
-For file-list InfoTips, look for `fileInfoTips=1` at initialization and a
-`File InfoTip` line when a tooltip receives the material.
+For file-list and desktop icon InfoTips, look for `fileInfoTips=1` at
+initialization and a `File InfoTip` line when a tooltip receives the material.
+The `Material ... applied=1` log means DWM accepted the backdrop settings;
+it does not confirm that the native tooltip background was cleared.
 
 ## Credits and license
 

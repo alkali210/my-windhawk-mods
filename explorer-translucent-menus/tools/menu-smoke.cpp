@@ -1969,10 +1969,6 @@ void CheckInfoTipUnload(HWND tip, TOOLINFOW& tool) {
     SendMessageW(tip, etm::g_detachInfoTipMessage, 0, 0);
     Check(!GetPropW(tip, etm::kInfoTipStateProperty),
           "the next tooltip presentation must publish fresh state");
-    Check(WindhawkUtils::SetFunctionHook(CreateWindowExW, etm::CreateWindowExWHook,
-                                        &etm::g_createWindowEx) &&
-          MH_EnableHook(reinterpret_cast<void*>(CreateWindowExW)) == MH_OK,
-          "tooltip unload uses the normal mod lifecycle");
     infoTipPublicationGate = tip;
     SendMessageW(tip, TTM_TRACKACTIVATE, TRUE, reinterpret_cast<LPARAM>(&tool));
     infoTipPublicationGate = nullptr;
@@ -1986,6 +1982,47 @@ void CheckInfoTipUnload(HWND tip, TOOLINFOW& tool) {
         RemovePropW(tip, etm::kInfoTipStateProperty));
     Check(!leftover, "unload leaves no stale state on a reusable tooltip window");
     delete leftover;
+}
+
+COLORREF SampleInfoTip(HWND tip) {
+    RECT bounds{};
+    GetWindowRect(tip, &bounds);
+    DwmFlush();
+    HDC dc = GetDC(nullptr);
+    COLORREF pixel = GetPixel(dc, bounds.right - 12, (bounds.top + bounds.bottom) / 2);
+    ReleaseDC(nullptr, dc);
+    return pixel;
+}
+
+void CheckDesktopInfoTip(HWND tip, HWND view, bool styled, const char* description) {
+    wchar_t label[] = L"Desktop item information";
+    TOOLINFOW tool{sizeof(tool)};
+    tool.uFlags = TTF_TRACK | TTF_ABSOLUTE;
+    tool.hwnd = view;
+    tool.uId = 1;
+    tool.lpszText = label;
+    Check(tip && GetWindowTheme(tip) &&
+          SendMessageW(tip, TTM_ADDTOOLW, 0, reinterpret_cast<LPARAM>(&tool)),
+          "a themed desktop tooltip accepts a tracking tool");
+    if (!tip)
+        return;
+    POINT position{200, 150};
+    ClientToScreen(view, &position);
+    SendMessageW(tip, TTM_TRACKPOSITION, 0, MAKELPARAM(position.x, position.y));
+    SendMessageW(tip, TTM_TRACKACTIVATE, TRUE, reinterpret_cast<LPARAM>(&tool));
+    PumpFor(300);
+    auto* state = static_cast<etm::InfoTipState*>(GetPropW(tip, etm::kInfoTipStateProperty));
+    Check(IsWindowVisible(tip) &&
+          (styled ? state && state->styled && state->source == view : !state),
+          description);
+    if (styled) {
+        COLORREF pixel = SampleInfoTip(tip);
+        Check(pixel != CLR_INVALID && GetGValue(pixel) > 150 &&
+              GetRValue(pixel) > GetGValue(pixel) + 2,
+              "desktop tooltip pixels show the acrylic tint, not the native white fill");
+    }
+    SendMessageW(tip, TTM_TRACKACTIVATE, FALSE, reinterpret_cast<LPARAM>(&tool));
+    SendMessageW(tip, TTM_DELTOOLW, 0, reinterpret_cast<LPARAM>(&tool));
 }
 
 void CheckInfoTipFade() {
@@ -2009,11 +2046,26 @@ void CheckInfoTipFade() {
         wc.hInstance = instance;
         wc.hbrBackground = static_cast<HBRUSH>(GetStockObject(WHITE_BRUSH));
         wc.lpszClassName = name;
-        if (!RegisterClassW(&wc)) return HWND{};
+        if (!RegisterClassW(&wc) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS)
+            return HWND{};
         return CreateWindowW(name, L"InfoTip fade fixture",
             WS_VISIBLE | (parent ? WS_CHILD : WS_OVERLAPPEDWINDOW),
             parent ? 0 : 200, parent ? 0 : 210, width, height, parent, nullptr, instance, nullptr);
     };
+    HWND desktop = create(L"Progman", nullptr, 660, 460);
+    auto desktopList = [&](HWND host) {
+        HWND shell = host ? create(L"SHELLDLL_DefView", host, 620, 410) : nullptr;
+        HWND list = shell ? CreateWindowW(WC_LISTVIEWW, L"FolderView", WS_CHILD | WS_VISIBLE,
+            0, 0, 620, 410, shell, nullptr, instance, nullptr) : nullptr;
+        if (list)
+            ListView_SetExtendedListViewStyle(list, LVS_EX_INFOTIP);
+        return list;
+    };
+    HWND icons = desktopList(desktop);
+    HWND iconsTip = icons ? ListView_GetToolTips(icons) : nullptr;
+    Check(iconsTip && !GetWindow(iconsTip, GW_OWNER),
+          "the pre-existing desktop list view uses an ownerless tooltip");
+
     HWND owner = create(L"CabinetWClass", nullptr, 660, 460);
     HWND shell = owner ? create(L"SHELLDLL_DefView", owner, 620, 410) : nullptr;
     HWND view = shell ? create(L"DirectUIHWND", shell, 620, 410) : nullptr;
@@ -2021,15 +2073,32 @@ void CheckInfoTipFade() {
         WS_POPUP | TTS_NOPREFIX | TTS_ALWAYSTIP, 0, 0, 0, 0,
         owner, nullptr, instance, nullptr) : nullptr;
     Check(tip && GetWindowTheme(tip), "a real themed tooltip was created");
-    if (tip && GetWindowTheme(tip)) {
-        etm::g_settings.styleFileInfoTips = true;
-        etm::g_settings.theme = 1;
-        etm::g_settings.hideMenuBorder = true;
-        etm::g_settings.tintOpacity = 40;
-        etm::g_settings.lightTint = RGB(250, 227, 246);
-        etm::g_detachInfoTipMessage = RegisterWindowMessageW(L"ETM.Fixture.DetachInfoTip");
-        etm::AttachInfoTip(tip);
+    etm::g_settings.styleFileInfoTips = true;
+    etm::g_settings.theme = 1;
+    etm::g_settings.hideMenuBorder = true;
+    etm::g_settings.tintOpacity = 40;
+    etm::g_settings.lightTint = RGB(250, 227, 246);
+    etm::g_detachInfoTipMessage = RegisterWindowMessageW(L"ETM.Fixture.DetachInfoTip");
+    Check(WindhawkUtils::SetFunctionHook(CreateWindowExW, etm::CreateWindowExWHook,
+                                        &etm::g_createWindowEx) &&
+          MH_EnableHook(reinterpret_cast<void*>(CreateWindowExW)) == MH_OK,
+          "the normal mod lifecycle can attach to existing and new tooltips");
+    Wh_ModAfterInit();
+    CheckDesktopInfoTip(iconsTip, icons, true, "existing Progman icon tooltip gets the material");
+    if (desktop) DestroyWindow(desktop);
 
+    desktop = create(L"WorkerW", nullptr, 660, 460);
+    icons = desktopList(desktop);
+    iconsTip = icons ? ListView_GetToolTips(icons) : nullptr;
+    CheckDesktopInfoTip(iconsTip, icons, true, "new WorkerW icon tooltip gets the material");
+    HWND unrelated = icons ? CreateWindowExW(WS_EX_TOPMOST, TOOLTIPS_CLASSW, nullptr,
+        WS_POPUP | TTS_NOPREFIX | TTS_ALWAYSTIP, 0, 0, 0, 0,
+        nullptr, nullptr, instance, nullptr) : nullptr;
+    CheckDesktopInfoTip(unrelated, icons, false, "an unrelated ownerless tooltip stays native");
+    if (unrelated) DestroyWindow(unrelated);
+    if (desktop) DestroyWindow(desktop);
+
+    if (tip && GetWindowTheme(tip)) {
         wchar_t label[] = L"Type: C++ source\r\nSize: 130 KB\r\nModified: 2026/11/21";
         TOOLINFOW tool{sizeof(tool)};
         tool.uFlags = TTF_TRACK | TTF_ABSOLUTE;
@@ -2044,16 +2113,7 @@ void CheckInfoTipFade() {
         SendMessageW(tip, TTM_TRACKPOSITION, 0, MAKELPARAM(position.x, position.y));
         SendMessageW(tip, TTM_TRACKACTIVATE, TRUE, reinterpret_cast<LPARAM>(&tool));
         PumpFor(380);
-        RECT bounds{};
-        GetWindowRect(tip, &bounds);
-        auto sample = [&] {
-            DwmFlush();
-            HDC dc = GetDC(nullptr);
-            COLORREF pixel = GetPixel(dc, bounds.right - 12, (bounds.top + bounds.bottom) / 2);
-            ReleaseDC(nullptr, dc);
-            return pixel;
-        };
-        COLORREF visible = sample();
+        COLORREF visible = SampleInfoTip(tip);
         Check(IsWindowVisible(tip) && visible != CLR_INVALID && GetGValue(visible) > 150 &&
               GetRValue(visible) > GetGValue(visible) + 2,
               "the visible InfoTip has a light acrylic tint");
@@ -2075,7 +2135,7 @@ void CheckInfoTipFade() {
             // Repaint while the old frame is still fading, as when moving
             // across the file list before the next tooltip has opened.
             RedrawWindow(tip, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_UPDATENOW);
-            COLORREF fading = sample();
+            COLORREF fading = SampleInfoTip(tip);
             Check(IsWindowVisible(tip) && fading != CLR_INVALID &&
                   GetGValue(fading) + 8 >= GetGValue(visible),
                   "repainting during the native fade does not darken the InfoTip");
