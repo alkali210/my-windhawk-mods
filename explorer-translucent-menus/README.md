@@ -105,7 +105,8 @@ classic popups while a menu is tracked. Preparation validates resources before
 applying effects and exposes the popup to drawing hooks only after commit.
 Only successful state changes are recorded for cleanup. Memory DCs are left
 to Windows unless they match the exact target of a synchronous Shell
-`WM_DRAWITEM` or window menu draw message.
+`WM_DRAWITEM` or native popup drawing message. This preserves the native
+opening animation for menus drawn offscreen, including scrollbar context menus.
 GDI and UxTheme hooks are installed in Explorer, but forward to Windows outside
 a tracked menu. The scope is the popup effect, rather than a replacement for
 Explorer's overall interface rendering.

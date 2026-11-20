@@ -1574,6 +1574,91 @@ void ShowTestMenu(HWND owner, HMENU menu, bool active, bool select = false, bool
     }
 }
 
+void CALLBACK SampleScrollMenu(HWND owner, UINT, UINT_PTR timer, DWORD) {
+    KillTimer(owner, timer);
+    HWND popup = nullptr;
+    EnumThreadWindows(GetCurrentThreadId(), [](HWND hwnd, LPARAM param) -> BOOL {
+        if (!IsWindowVisible(hwnd) || !etm::IsClassicPopup(hwnd))
+            return TRUE;
+        *reinterpret_cast<HWND*>(param) = hwnd;
+        return FALSE;
+    }, reinterpret_cast<LPARAM>(&popup));
+    MENUBARINFO bar{sizeof(bar)};
+    RECT row{};
+    HDC screen = GetDC(nullptr);
+    bool visible = screen && popup && GetMenuBarInfo(popup, OBJID_CLIENT, 0, &bar) &&
+                   GetMenuItemRect(owner, bar.hMenu, 0, &row);
+    Check(visible, "the native scrollbar context menu opens");
+    if (visible) {
+        DwmFlush();
+        int padding = MulDiv(10, GetDpiForWindow(popup), 96);
+        int middle = (row.top + row.bottom) / 2;
+        COLORREF gutter = GetPixel(screen, row.left + padding, middle);
+        COLORREF body = GetPixel(screen, row.right - padding, middle);
+        auto tinted = [](COLORREF color) {
+            return color != CLR_INVALID &&
+                GetRValue(color) > GetGValue(color) + 40 &&
+                GetBValue(color) > GetGValue(color) + 40;
+        };
+        Check(tinted(gutter) && tinted(body),
+              "the scrollbar menu's opening frame has no opaque gutter");
+        RECT bounds{};
+        Check(GetWindowRect(popup, &bounds) &&
+              (ColorDistance(GetPixel(screen, bounds.left, middle), gutter) < 55) ==
+                  etm::g_settings.hideMenuBorder,
+              "the scrollbar menu's outline follows the hide border setting");
+        bool glyph = false;
+        for (int y = row.top + 2; y < row.bottom - 2 && !glyph; y += 2) {
+            for (int x = row.left + padding; x < row.right - padding; x += 2) {
+                COLORREF color = GetPixel(screen, x, y);
+                if (color != CLR_INVALID && GetRValue(color) < 75 &&
+                    GetGValue(color) < 75 && GetBValue(color) < 75) {
+                    glyph = true;
+                    break;
+                }
+            }
+        }
+        Check(glyph, "the scrollbar menu's item text is visible before any hover");
+    }
+    if (screen) ReleaseDC(nullptr, screen);
+    EndMenu();
+}
+
+void CheckScrollMenu(HWND owner) {
+    HWND scroll = CreateWindowW(WC_SCROLLBAR, nullptr, WS_CHILD | WS_VISIBLE | SBS_VERT,
+        480, 35, 24, 270, owner, nullptr, GetModuleHandleW(nullptr), nullptr);
+    if (!scroll) {
+        Check(false, "native scrollbar fixture created");
+        return;
+    }
+    SCROLLINFO info{sizeof(info), SIF_RANGE | SIF_PAGE | SIF_POS, 0, 100, 45, 30};
+    SetScrollInfo(scroll, SB_CTL, &info, TRUE);
+    etm::g_settings.theme = 1;
+    etm::g_settings.lightTint = RGB(220, 10, 170);
+    etm::g_settings.tintOpacity = 85;
+    SetForegroundWindow(owner);
+    UpdateWindow(owner);
+    POINT cursor{}, away{10, 10}, anchor{12, 95};
+    GetCursorPos(&cursor);
+    ClientToScreen(owner, &away);
+    ClientToScreen(scroll, &anchor);
+    SetCursorPos(away.x, away.y);
+    for (bool hide : {false, true}) {
+        etm::g_settings.hideMenuBorder = hide;
+        UINT_PTR timer = SetTimer(owner, 3, 650, SampleScrollMenu);
+        if (!timer) {
+            Check(false, "scrollbar menu sampling timer created");
+            break;
+        }
+        // Let the actual scrollbar open its menu with the system animation.
+        SendMessageW(scroll, WM_CONTEXTMENU, reinterpret_cast<WPARAM>(scroll),
+                     MAKELPARAM(anchor.x, anchor.y));
+        KillTimer(owner, timer);
+    }
+    SetCursorPos(cursor.x, cursor.y);
+    DestroyWindow(scroll);
+}
+
 bool windowMenuPaintObserved;
 bool windowMenuTinted;
 bool windowMenuSelect;
@@ -1842,6 +1927,7 @@ int main(int argc, char** argv) {
     bool probeHighlight = argc > 1 && strcmp(argv[1], "--probe-highlight") == 0;
     bool probeReplayMask = argc > 1 && strcmp(argv[1], "--probe-replay-mask") == 0;
     bool probeWindowMenu = argc > 1 && strcmp(argv[1], "--probe-window-menu") == 0;
+    bool probeScrollMenu = argc > 1 && strcmp(argv[1], "--probe-scroll-menu") == 0;
     highlightGeometryOnly = probeHighlight;
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     previewMode = preview;
@@ -1889,7 +1975,8 @@ int main(int argc, char** argv) {
         printf("Failures: %d\n", failures);
         return result;
     }
-    if (!selectionFade && !probeHighlight && !probeReplayMask) CheckNativeBypass();
+    if (!selectionFade && !probeHighlight && !probeReplayMask && !probeScrollMenu)
+        CheckNativeBypass();
 
     WNDCLASSW wc{};
     wc.lpfnWndProc = OwnerProc;
@@ -1900,7 +1987,8 @@ int main(int argc, char** argv) {
     HWND owner = CreateWindowW(wc.lpszClassName, L"Isolated menu test - no Explorer changes",
         WS_OVERLAPPEDWINDOW | WS_VISIBLE, 160, 140, 680, 440, nullptr, nullptr, wc.hInstance, nullptr);
     Check(!etm::IsClassicPopup(owner), "ordinary/modern window class excluded");
-    if (!selectionFade && !probeHighlight && !probeReplayMask) CheckLateCtrlBypass(owner);
+    if (!selectionFade && !probeHighlight && !probeReplayMask && !probeScrollMenu)
+        CheckLateCtrlBypass(owner);
 
     HMENU child = CreatePopupMenu();
     AppendMenuW(child, MF_STRING, 42, L"&Test command\tEnter");
@@ -1910,7 +1998,9 @@ int main(int argc, char** argv) {
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING | MF_CHECKED, 44, L"Checked command");
     Check(etm::IsSupportedMenu(menu, owner), "standard menu recognized");
-    if (selectionFade) {
+    if (probeScrollMenu) {
+        CheckScrollMenu(owner);
+    } else if (selectionFade) {
         CheckSelectionFade(owner);
     } else if (preview) {
         SetWindowTextW(owner, L"Menu material visual check - isolated fixture");

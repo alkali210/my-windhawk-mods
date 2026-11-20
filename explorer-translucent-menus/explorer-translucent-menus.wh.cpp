@@ -131,7 +131,8 @@ classic popups while a menu is tracked. Preparation validates resources before
 applying effects and exposes the popup to drawing hooks only after commit.
 Only successful state changes are recorded for cleanup. Memory DCs are left
 to Windows unless they match the exact target of a synchronous Shell
-`WM_DRAWITEM` or window menu draw message.
+`WM_DRAWITEM` or native popup drawing message. This preserves the native
+opening animation for menus drawn offscreen, including scrollbar context menus.
 GDI and UxTheme hooks are installed in Explorer, but forward to Windows outside
 a tracked menu. The scope is the popup effect, rather than a replacement for
 Explorer's overall interface rendering.
@@ -1358,6 +1359,12 @@ LRESULT CALLBACK MenuPopupSubclass(HWND hwnd,
                                    UINT_PTR id,
                                    DWORD_PTR data);
 
+struct UahPaintTarget {
+    HWND hwnd;
+    HDC dc;
+    const DRAWITEMSTRUCT* item;
+};
+
 struct MenuScope {
     MenuScope* previous = nullptr;
     MenuScope* next = nullptr;
@@ -1371,8 +1378,7 @@ struct MenuScope {
     unsigned count = 0;
     HWND paintingWindow = nullptr;
     const DRAWITEMSTRUCT* drawingItem = nullptr;
-    HDC windowMenuDC = nullptr;
-    const DRAWITEMSTRUCT* windowMenuItem = nullptr;
+    const UahPaintTarget* uahPaint = nullptr;
     bool allowed = false;
     bool clickCommand = false;
     UINT commandId = 0;
@@ -1921,7 +1927,7 @@ bool HandleMenuClick(MenuScope& scope, Popup& popup, WPARAM position,
     return true;
 }
 
-HDC WindowMenuDrawDC(HMENU menu, UINT message, LPARAM lParam) {
+HDC UahDrawDC(HMENU menu, UINT message, LPARAM lParam) {
     if (!lParam)
         return nullptr;
     if (message == kUahDrawMenuItem) {
@@ -1968,22 +1974,26 @@ LRESULT CALLBACK MenuPopupSubclass(HWND hwnd,
     // MN_BUTTONUP is native menu-item activation, not a raw mouse-up.
     if (message == kMenuButtonUp && HandleMenuClick(*scope, *popup, wParam, lParam))
         return 0;
-    if (scope->windowMenu && popup->active) {
-        if (HDC dc = WindowMenuDrawDC(popup->menu, message, lParam)) {
-            // UAH paints the system menu's outline into the opening frame
-            // independently of the DWM border attribute.
-            if (message == kUahNcPaintMenuPopup && g_settings.hideMenuBorder)
-                return TRUE;
-            // Bind only the exact target of this synchronous draw.
-            HWND previousWindow = scope->paintingWindow;
-            HDC previousDC = scope->windowMenuDC;
-            const auto* previousItem = scope->windowMenuItem;
-            scope->paintingWindow = hwnd;
-            scope->windowMenuDC = dc;
-            scope->windowMenuItem = message == kUahDrawMenuItem
-                ? reinterpret_cast<const DRAWITEMSTRUCT*>(lParam) : nullptr;
-            if (const auto* item = scope->windowMenuItem;
-                item && g_settings.selectionFade == SelectionFade::Replay) {
+    if (popup->active) {
+        if (HDC dc = UahDrawDC(popup->menu, message, lParam)) {
+            // UAH paints the outline independently of DWM. Otherwise leave
+            // that draw native, including on the opening frame's memory DC.
+            if (message == kUahNcPaintMenuPopup) {
+                if (g_settings.hideMenuBorder)
+                    return TRUE;
+                return DefSubclassProc(hwnd, message, wParam, lParam);
+            }
+            // The opening frame can be drawn to a memory DC. Bind only the
+            // exact synchronous UAH target, separately from Shell WM_DRAWITEM.
+            UahPaintTarget paint{
+                hwnd, dc, message == kUahDrawMenuItem
+                    ? reinterpret_cast<const DRAWITEMSTRUCT*>(lParam)
+                    : nullptr};
+            const auto* previousPaint = scope->uahPaint;
+            scope->uahPaint = &paint;
+            if (const auto* item = paint.item;
+                scope->windowMenu && item &&
+                g_settings.selectionFade == SelectionFade::Replay) {
                 if (item->itemState & ODS_SELECTED) {
                     popup->windowMenuRow = item->rcItem;
                     popup->windowMenuRowId = item->itemID;
@@ -1992,9 +2002,7 @@ LRESULT CALLBACK MenuPopupSubclass(HWND hwnd,
                 }
             }
             LRESULT result = DefSubclassProc(hwnd, message, wParam, lParam);
-            scope->windowMenuItem = previousItem;
-            scope->windowMenuDC = previousDC;
-            scope->paintingWindow = previousWindow;
+            scope->uahPaint = previousPaint;
             return result;
         }
     }
@@ -2067,14 +2075,18 @@ LRESULT CALLBACK MenuOwnerSubclass(HWND hwnd,
 }
 
 // Require a positive DC association, never the last observed popup. A memory
-// DC must match the exact synchronous Shell or window menu drawing target.
+// DC must match the exact synchronous Shell or native popup drawing target.
 Popup* DrawingPopupForDC(HDC dc) {
     MenuScope* scope = t_scope;
     if (!scope || !scope->allowed || g_stopping.load(std::memory_order_relaxed))
         return nullptr;
-    bool scopedDC = (scope->drawingItem && dc == scope->drawingItem->hDC) ||
-                    (scope->windowMenuDC && dc == scope->windowMenuDC);
-    HWND hwnd = scopedDC ? scope->paintingWindow : WindowFromDC(dc);
+    HWND hwnd;
+    if (scope->drawingItem && dc == scope->drawingItem->hDC)
+        hwnd = scope->paintingWindow;
+    else if (scope->uahPaint && dc == scope->uahPaint->dc)
+        hwnd = scope->uahPaint->hwnd;
+    else
+        hwnd = WindowFromDC(dc);
     if (!hwnd || !IsClassicPopup(hwnd))
         return nullptr;
     Popup* popup = scope->Find(hwnd);
@@ -2131,10 +2143,12 @@ void RememberReplayHighlight(Popup& popup, HDC dc, const RECT& rect) {
     }
     // A verified drawing DC may belong to the owner or be a memory DC.
     // Remember its bounds relative to the item until its screen rect is known.
-    const DRAWITEMSTRUCT* item = t_scope
-        ? (t_scope->windowMenu ? t_scope->windowMenuItem : t_scope->drawingItem)
-        : nullptr;
-    if (!item || t_scope->paintingWindow != popup.hwnd || item->hDC != dc ||
+    if (!t_scope)
+        return;
+    const UahPaintTarget* uah = t_scope->windowMenu ? t_scope->uahPaint : nullptr;
+    const DRAWITEMSTRUCT* item = uah ? uah->item : t_scope->drawingItem;
+    HWND hwnd = uah ? uah->hwnd : t_scope->paintingWindow;
+    if (!item || hwnd != popup.hwnd || item->hDC != dc ||
         item->CtlType != ODT_MENU || !(item->itemState & ODS_SELECTED) ||
         reinterpret_cast<HMENU>(item->hwndItem) != popup.menu)
         return;
