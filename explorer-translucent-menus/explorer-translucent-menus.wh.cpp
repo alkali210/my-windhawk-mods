@@ -46,9 +46,9 @@ Tint and transparency adjustments
 
 ![tint](https://raw.githubusercontent.com/alkali210/my-windhawk-mods/main/explorer-translucent-menus/screenshots/02-tint-transparency.png)
 
-Borders and submenus
+Borders, submenus, hover highlights, and file tooltips
 
-![borders](https://raw.githubusercontent.com/alkali210/my-windhawk-mods/main/explorer-translucent-menus/screenshots/03-border-submenus.png)
+![Borders, submenus, custom hover highlight colors and corner radii, and a translucent file tooltip](https://raw.githubusercontent.com/alkali210/my-windhawk-mods/main/explorer-translucent-menus/screenshots/03-border-submenus.png)
 
 ## Requirements
 
@@ -103,6 +103,8 @@ file-list InfoTips the same material, tint, theme, corners, and border setting.
 The option is off by default. Windows still supplies the text, layout, hover
 delay, and animations. A tooltip keeps its material through the native fade-out.
 Navigation, toolbar, and taskbar tooltips are unchanged.
+Unloading or reloading the mod clears its state from existing tooltip windows
+before they can be reused.
 
 ### Menu item click animation
 
@@ -198,6 +200,9 @@ For the title bar option, the initialization line reports `titleBarMenu=1`
 when enabled. Look for `Title bar menu` owner, entry, and system-menu lines,
 followed by the material result. With Windhawk logging disabled, these lines
 are not emitted even if the mod is loaded.
+
+For file-list InfoTips, look for `fileInfoTips=1` at initialization and a
+`File InfoTip` line when a tooltip receives the material.
 
 ## Credits and license
 
@@ -3324,8 +3329,9 @@ BOOL CALLBACK VisitExplorerSurfaces(HWND hwnd, LPARAM attach) {
         if (attach) {
             AttachInfoTip(hwnd);
         } else {
-            if (GetPropW(hwnd, kInfoTipStateProperty))
-                SendMessageW(hwnd, g_detachInfoTipMessage, 0, 0);
+            // Clean up on the window thread even if state publication is in
+            // flight. A cross-thread property check can miss that state.
+            SendMessageW(hwnd, g_detachInfoTipMessage, 0, 0);
             WindhawkUtils::RemoveWindowSubclassFromAnyThread(hwnd, InfoTipSubclass);
         }
     }

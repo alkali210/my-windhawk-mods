@@ -20,9 +20,9 @@ Tint and transparency adjustments
 
 ![tint](https://raw.githubusercontent.com/alkali210/my-windhawk-mods/main/explorer-translucent-menus/screenshots/02-tint-transparency.png)
 
-Borders and submenus
+Borders, submenus, hover highlights, and file tooltips
 
-![borders](https://raw.githubusercontent.com/alkali210/my-windhawk-mods/main/explorer-translucent-menus/screenshots/03-border-submenus.png)
+![Borders, submenus, custom hover highlight colors and corner radii, and a translucent file tooltip](https://raw.githubusercontent.com/alkali210/my-windhawk-mods/main/explorer-translucent-menus/screenshots/03-border-submenus.png)
 
 ## Requirements
 
@@ -77,6 +77,8 @@ file-list InfoTips the same material, tint, theme, corners, and border setting.
 The option is off by default. Windows still supplies the text, layout, hover
 delay, and animations. A tooltip keeps its material through the native fade-out.
 Navigation, toolbar, and taskbar tooltips are unchanged.
+Unloading or reloading the mod clears its state from existing tooltip windows
+before they can be reused.
 
 ### Menu item click animation
 

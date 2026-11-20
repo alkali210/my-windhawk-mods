@@ -184,6 +184,8 @@ BOOL WINAPI TestSystemParametersInfoW(UINT action, UINT param, PVOID value, UINT
     return SystemParametersInfoW(action, param, value, flags);
 }
 
+BOOL WINAPI TestSetProp(HWND hwnd, LPCWSTR name, HANDLE value);
+
 #define SystemParametersInfoW TestSystemParametersInfoW
 #define DwmSetWindowAttribute TestDwmSetAttribute
 #define SetWindowPos TestSetWindowPos
@@ -192,6 +194,7 @@ BOOL WINAPI TestSystemParametersInfoW(UINT action, UINT param, PVOID value, UINT
 #define BufferedPaintUnInit TestBufferedPaintUnInit
 #define GetDCEx TestGetDCEx
 #define DwmGetWindowAttribute TestDwmGetAttribute
+#define SetPropW TestSetProp
 #define ETM_TEST
 #include "../explorer-translucent-menus.wh.cpp"
 #undef SetWindowSubclass
@@ -204,9 +207,29 @@ BOOL WINAPI TestSystemParametersInfoW(UINT action, UINT param, PVOID value, UINT
 #undef GetDCEx
 #undef DwmGetWindowAttribute
 #undef SystemParametersInfoW
+#undef SetPropW
 
 int failures = 0;
 bool emulateUnprotectedBorder = false;
+
+HWND infoTipPublicationGate;
+HANDLE infoTipUnloadThread;
+bool infoTipUnloadSendPending;
+BOOL WINAPI TestSetProp(HWND hwnd, LPCWSTR name, HANDLE value) {
+    if (hwnd == infoTipPublicationGate && name == etm::kInfoTipStateProperty) {
+        infoTipPublicationGate = nullptr;
+        infoTipUnloadThread = CreateThread(nullptr, 0, [](LPVOID) -> DWORD {
+            Wh_ModBeforeUninit();
+            return 0;
+        }, nullptr, 0, nullptr);
+        // Wait for the synchronous unload send without dispatching it, so the
+        // property is published after enumeration but before UI-thread cleanup.
+        infoTipUnloadSendPending = infoTipUnloadThread &&
+            MsgWaitForMultipleObjectsEx(0, nullptr, 3000, QS_SENDMESSAGE,
+                                        MWMO_INPUTAVAILABLE) == WAIT_OBJECT_0;
+    }
+    return SetPropW(hwnd, name, value);
+}
 HRESULT WINAPI ObserveDwmSetAttribute(HWND hwnd, DWORD attribute, LPCVOID value, DWORD size) {
     return emulateUnprotectedBorder ? TestDwmSetAttribute(hwnd, attribute, value, size)
         : etm::DwmSetWindowAttributeHook(hwnd, attribute, value, size);
@@ -1942,6 +1965,29 @@ int RunWindowMenuProbe() {
     return failures ? 1 : 0;
 }
 
+void CheckInfoTipUnload(HWND tip, TOOLINFOW& tool) {
+    SendMessageW(tip, etm::g_detachInfoTipMessage, 0, 0);
+    Check(!GetPropW(tip, etm::kInfoTipStateProperty),
+          "the next tooltip presentation must publish fresh state");
+    Check(WindhawkUtils::SetFunctionHook(CreateWindowExW, etm::CreateWindowExWHook,
+                                        &etm::g_createWindowEx) &&
+          MH_EnableHook(reinterpret_cast<void*>(CreateWindowExW)) == MH_OK,
+          "tooltip unload uses the normal mod lifecycle");
+    infoTipPublicationGate = tip;
+    SendMessageW(tip, TTM_TRACKACTIVATE, TRUE, reinterpret_cast<LPARAM>(&tool));
+    infoTipPublicationGate = nullptr;
+    Check(infoTipUnloadSendPending, "unload reached the UI send before state publication");
+    if (infoTipUnloadThread) {
+        while (WaitForSingleObject(infoTipUnloadThread, 0) == WAIT_TIMEOUT)
+            PumpFor(5);
+        CloseHandle(infoTipUnloadThread);
+    }
+    auto* leftover = static_cast<etm::InfoTipState*>(
+        RemovePropW(tip, etm::kInfoTipStateProperty));
+    Check(!leftover, "unload leaves no stale state on a reusable tooltip window");
+    delete leftover;
+}
+
 void CheckInfoTipFade() {
     ACTCTXW request{sizeof(request)};
     request.lpSource = L"tools/tooltip-controls.manifest";
@@ -2038,6 +2084,7 @@ void CheckInfoTipFade() {
         }
         PumpFor(420);
         Check(!IsWindowVisible(tip), "Windows finishes dismissing the InfoTip");
+        CheckInfoTipUnload(tip, tool);
     }
     if (tip) DestroyWindow(tip);
     if (owner) DestroyWindow(owner);
