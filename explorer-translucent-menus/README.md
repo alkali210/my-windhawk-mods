@@ -35,7 +35,7 @@ use **Shift+F10**. Select **Native** to disable all hooks. For a temporary bypas
 enable **Hold Ctrl to bypass** in the settings, then hold **Ctrl** before opening
 a menu.
 
-## Materials
+## Materials and Tint
 
 | Material | Tint opacity |
 | --- | --- |
@@ -50,11 +50,17 @@ a menu.
 Tint opacity changes the material, not text or icons. Theme selection controls
 the light or dark palette.
 
+## Hover highlight
+
 **Hover highlight color** accepts `#RRGGBB` (for example, `#FF6A00`).
 The default `auto` keeps the existing light and dark colors; invalid values
 also use those colors. Opacity is adjustable separately.
 The corner radius and inset are measured in device-independent pixels (DIP).
 These settings have no effect when highlight opacity is 0 (native highlight).
+
+When upgrading from a version without these groups, re-enter any custom
+material, tint, theme, highlight, or click animation values. Windhawk stores
+grouped settings under new keys. Settings outside the groups carry over.
 
 ## Appearance
 
@@ -68,22 +74,31 @@ animation and on later repaints.
 
 Enable **Apply material to title bar menu** to also style File Explorer's
 window menu, opened by right-clicking the title bar or pressing `Alt+Space`.
-This option is off by default. It uses the same material, theme, border,
-corner, highlight, and mouse click animation settings as context menus.
-Opening animations and keyboard command activation remain native.
+It uses the same material, theme, border, corner, highlight, and mouse click
+animation settings as context menus. Opening animations and keyboard command
+activation remain native.
 
 Enable **Apply material to file information tooltips** to give File Explorer's
 file-list and desktop icon InfoTips the same material, tint, theme, corners,
 and border setting.
-The option is off by default. Windows still supplies the text, layout, hover
-delay, and animations. A tooltip keeps its material through the native fade-out.
-Navigation, toolbar, and taskbar tooltips are unchanged.
+Windows still supplies the text, layout, hover delay, and animations. A
+tooltip keeps its material through the native fade-out.
+
+Enable **Apply material to navigation pane label tooltips** to style the full
+label that appears when you hover over a truncated name in File Explorer's
+navigation pane. Windows still controls when and where the label opens and
+how it dismisses. Other navigation, toolbar, and taskbar tooltips are unchanged.
+
+These three options are enabled by default on new installs and can be turned
+off independently.
+
 Unloading or reloading the mod clears its state from existing tooltip windows
 before they can be reused.
 
 ### Menu item click animation
 
-**Menu item click animation** offers three choices after mouse selection:
+Under **Hover highlight**, **Menu item click animation** offers three choices
+after mouse selection:
 
 | Choice | Behavior after clicking a command |
 | --- | --- |
@@ -178,6 +193,8 @@ are not emitted even if the mod is loaded.
 
 For file-list and desktop icon InfoTips, look for `fileInfoTips=1` at
 initialization and a `File InfoTip` line when a tooltip receives the material.
+For truncated navigation labels, look for `navigationTooltips=1` and a
+`Navigation label tooltip` line.
 The `Material ... applied=1` log means DWM accepted the backdrop settings;
 it does not confirm that the native tooltip background was cleared.
 

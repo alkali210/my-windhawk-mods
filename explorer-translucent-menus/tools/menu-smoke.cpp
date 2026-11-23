@@ -2025,6 +2025,81 @@ void CheckDesktopInfoTip(HWND tip, HWND view, bool styled, const char* descripti
     SendMessageW(tip, TTM_DELTOOLW, 0, reinterpret_cast<LPARAM>(&tool));
 }
 
+void CheckNavigationLabelTooltip(HWND owner, HWND pane) {
+    HWND tree = pane ? CreateWindowW(WC_TREEVIEWW, nullptr,
+        WS_CHILD | WS_VISIBLE | TVS_NOHSCROLL, 0, 0, 150, 130, pane, nullptr,
+        GetModuleHandleW(nullptr), nullptr) : nullptr;
+    HWND tip = tree ? TreeView_GetToolTips(tree) : nullptr;
+    Check(tip && GetWindowTheme(tip), "navigation tree owns a native themed tooltip");
+    if (!tip)
+        return;
+    SetWindowTheme(tree, L"Explorer", nullptr);
+
+    wchar_t text[] = L"This Explorer folder name is too long for the navigation pane";
+    TVINSERTSTRUCTW insert{};
+    insert.hInsertAfter = TVI_LAST;
+    insert.item.mask = TVIF_TEXT;
+    insert.item.pszText = text;
+    HTREEITEM item = TreeView_InsertItem(tree, &insert);
+    RECT label{}, client{};
+    GetClientRect(tree, &client);
+    bool truncated = item && TreeView_GetItemRect(tree, item, &label, TRUE) &&
+                     label.right > client.right;
+    Check(truncated, "folder label is wider than the navigation tree");
+    if (!truncated)
+        return;
+
+    POINT original{};
+    const POINT itemPoint{label.left + 20, (label.top + label.bottom) / 2};
+    POINT hover = itemPoint;
+    POINT blank{400, 100};
+    GetCursorPos(&original);
+    ClientToScreen(tree, &hover);
+    ClientToScreen(owner, &blank);
+    SetWindowPos(pane, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+    SetWindowPos(owner, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+    SetForegroundWindow(owner);
+    SetCursorPos(blank.x, blank.y);
+    if (GetForegroundWindow() != owner && WindowFromPoint(blank) == owner) {
+        INPUT click[2]{};
+        click[0].type = click[1].type = INPUT_MOUSE;
+        click[0].mi.dwFlags = MOUSEEVENTF_LEFTDOWN;
+        click[1].mi.dwFlags = MOUSEEVENTF_LEFTUP;
+        SendInput(ARRAYSIZE(click), click, sizeof(INPUT));
+        PumpFor(100);
+    }
+    Check(GetForegroundWindow() == owner, "navigation tooltip fixture is foreground");
+    Check(WindowFromPoint(hover) == tree, "the truncated label is exposed to pointer input");
+    PumpFor(50);
+    SendMessageW(tip, TTM_SETDELAYTIME, TTDT_INITIAL, 100);
+    for (bool enabled : {false, true}) {
+        etm::g_settings.styleFileInfoTips = !enabled;
+        etm::g_settings.styleNavigationTooltips = enabled;
+        SetCursorPos(hover.x, hover.y);
+        SendMessageW(tree, WM_MOUSEMOVE, 0, MAKELPARAM(itemPoint.x, itemPoint.y));
+        ULONGLONG deadline = GetTickCount64() + 1500;
+        while (!IsWindowVisible(tip) && GetTickCount64() < deadline)
+            PumpFor(10);
+        PumpFor(200);
+        COLORREF pixel = IsWindowVisible(tip) ? SampleInfoTip(tip) : CLR_INVALID;
+        Check(pixel != CLR_INVALID && GetGValue(pixel) > 150 &&
+              (GetRValue(pixel) > GetGValue(pixel) + 2) == enabled,
+              enabled ? "native truncated label displays the configured acrylic tint"
+                      : "file InfoTip option alone leaves the truncated label native");
+        SetCursorPos(blank.x, blank.y);
+        SendMessageW(tree, WM_MOUSELEAVE, 0, 0);
+        deadline = GetTickCount64() + 1000;
+        while (IsWindowVisible(tip) && GetTickCount64() < deadline)
+            PumpFor(10);
+        Check(!IsWindowVisible(tip), "native label tooltip dismisses when the pointer leaves");
+    }
+    etm::g_settings.styleNavigationTooltips = false;
+    etm::g_settings.styleFileInfoTips = true;
+    SetWindowPos(owner, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+    SetCursorPos(original.x, original.y);
+    DestroyWindow(pane);
+}
+
 void CheckInfoTipFade() {
     ACTCTXW request{sizeof(request)};
     request.lpSource = L"tools/tooltip-controls.manifest";
@@ -2097,6 +2172,9 @@ void CheckInfoTipFade() {
     CheckDesktopInfoTip(unrelated, icons, false, "an unrelated ownerless tooltip stays native");
     if (unrelated) DestroyWindow(unrelated);
     if (desktop) DestroyWindow(desktop);
+
+    if (owner)
+        CheckNavigationLabelTooltip(owner, create(L"NamespaceTreeControl", owner, 160, 150));
 
     if (tip && GetWindowTheme(tip)) {
         wchar_t label[] = L"Type: C++ source\r\nSize: 130 KB\r\nModified: 2026/11/21";

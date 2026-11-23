@@ -4,7 +4,7 @@
 // @name:zh-CN      Explorer 上下文菜单半透明
 // @description     Translucent materials and optional borderless classic context menus for File Explorer
 // @description:zh-CN 对 Explorer 经典上下文菜单应用半透明材质和可选无边框
-// @version         1.3.0
+// @version         1.3.1
 // @author          alkali210
 // @github          https://github.com/alkali210
 // @include         explorer.exe
@@ -61,7 +61,7 @@ use **Shift+F10**. Select **Native** to disable all hooks. For a temporary bypas
 enable **Hold Ctrl to bypass** in the settings, then hold **Ctrl** before opening
 a menu.
 
-## Materials
+## Materials and Tint
 
 | Material | Tint opacity |
 | --- | --- |
@@ -76,11 +76,17 @@ a menu.
 Tint opacity changes the material, not text or icons. Theme selection controls
 the light or dark palette.
 
+## Hover highlight
+
 **Hover highlight color** accepts `#RRGGBB` (for example, `#FF6A00`).
 The default `auto` keeps the existing light and dark colors; invalid values
 also use those colors. Opacity is adjustable separately.
 The corner radius and inset are measured in device-independent pixels (DIP).
 These settings have no effect when highlight opacity is 0 (native highlight).
+
+When upgrading from a version without these groups, re-enter any custom
+material, tint, theme, highlight, or click animation values. Windhawk stores
+grouped settings under new keys. Settings outside the groups carry over.
 
 ## Appearance
 
@@ -94,22 +100,31 @@ animation and on later repaints.
 
 Enable **Apply material to title bar menu** to also style File Explorer's
 window menu, opened by right-clicking the title bar or pressing `Alt+Space`.
-This option is off by default. It uses the same material, theme, border,
-corner, highlight, and mouse click animation settings as context menus.
-Opening animations and keyboard command activation remain native.
+It uses the same material, theme, border, corner, highlight, and mouse click
+animation settings as context menus. Opening animations and keyboard command
+activation remain native.
 
 Enable **Apply material to file information tooltips** to give File Explorer's
 file-list and desktop icon InfoTips the same material, tint, theme, corners,
 and border setting.
-The option is off by default. Windows still supplies the text, layout, hover
-delay, and animations. A tooltip keeps its material through the native fade-out.
-Navigation, toolbar, and taskbar tooltips are unchanged.
+Windows still supplies the text, layout, hover delay, and animations. A
+tooltip keeps its material through the native fade-out.
+
+Enable **Apply material to navigation pane label tooltips** to style the full
+label that appears when you hover over a truncated name in File Explorer's
+navigation pane. Windows still controls when and where the label opens and
+how it dismisses. Other navigation, toolbar, and taskbar tooltips are unchanged.
+
+These three options are enabled by default on new installs and can be turned
+off independently.
+
 Unloading or reloading the mod clears its state from existing tooltip windows
 before they can be reused.
 
 ### Menu item click animation
 
-**Menu item click animation** offers three choices after mouse selection:
+Under **Hover highlight**, **Menu item click animation** offers three choices
+after mouse selection:
 
 | Choice | Behavior after clicking a command |
 | --- | --- |
@@ -204,6 +219,8 @@ are not emitted even if the mod is loaded.
 
 For file-list and desktop icon InfoTips, look for `fileInfoTips=1` at
 initialization and a `File InfoTip` line when a tooltip receives the material.
+For truncated navigation labels, look for `navigationTooltips=1` and a
+`Navigation label tooltip` line.
 The `Material ... applied=1` log means DWM accepted the backdrop settings;
 it does not confirm that the native tooltip background was cleared.
 
@@ -219,65 +236,72 @@ This implementation is distributed under GPL-3.0-or-later.
 
 // ==WindhawkModSettings==
 /*
-- backgroundEffect: acrylic
-  $name: Background material
-  $description: Applies only to classic Explorer popup menus. Native disables all modifications.
-  $options:
-  - none: Native
-  - solid: Solid
-  - transparent: Transparent
-  - acrylic: Acrylic (adjustable tint)
-  - modern-acrylic: Modern Acrylic
-  - system: System Acrylic
-  - mica: Mica
-  - mica-alt: Mica Alt
-- theme: auto
-  $name: Menu theme
-  $description: Select the palette for modified menus.
-  $options:
-  - auto: Follow Windows
-  - light: Light
-  - dark: Dark
-- tintOpacity: 35
-  $name: Tint opacity
-  $description: 0-100. Applies to Acrylic and Transparent.
-- lightTint: "#F5F5F5"
-  $name: Light tint color
-  $description: "#RRGGBB color for Solid, Transparent, Acrylic and Modern Acrylic in the light theme."
-- darkTint: "#202020"
-  $name: Dark tint color
-  $description: "#RRGGBB color for Solid, Transparent, Acrylic and Modern Acrylic in the dark theme."
-- highlightOpacity: 28
-  $name: Hover highlight opacity
-  $description: 1-100 for the custom highlight. Set to 0 to use the native highlight.
-- highlightColor: auto
-  $name: Hover highlight color
-  $description: "#RRGGBB for both themes, or auto for the default light and dark colors. Applies only to the custom highlight."
-- highlightRadius: 4
-  $name: Hover highlight corner radius
-  $description: Non-negative DIP, scaled with display DPI. Set to 0 for square corners.
-- highlightInset: 0
-  $name: Hover highlight inset
-  $description: Non-negative DIP on all sides, scaled with display DPI. A large inset can hide the highlight.
-- selectionFade: replay
-  $name: Menu item click animation
-  $description: Applies to modified menus only. Native can briefly show a black background; Replay fades a snapshot of the composited item. Menu opening animations are unchanged.
-  $options:
-  - native: Windows animation (may show black background)
-  - instant: Close immediately
-  - replay: Recreate fade animation
+- materialsAndTint:
+    - backgroundEffect: acrylic
+      $name: Background material
+      $description: Applies only to classic Explorer popup menus. Native disables all modifications.
+      $options:
+      - none: Native
+      - solid: Solid
+      - transparent: Transparent
+      - acrylic: Acrylic (adjustable tint)
+      - modern-acrylic: Modern Acrylic
+      - system: System Acrylic
+      - mica: Mica
+      - mica-alt: Mica Alt
+    - theme: auto
+      $name: Menu theme
+      $description: Select the palette for modified menus.
+      $options:
+      - auto: Follow Windows
+      - light: Light
+      - dark: Dark
+    - tintOpacity: 35
+      $name: Tint opacity
+      $description: 0-100. Applies to Acrylic and Transparent.
+    - lightTint: "#F5F5F5"
+      $name: Light tint color
+      $description: "#RRGGBB color for Solid, Transparent, Acrylic and Modern Acrylic in the light theme."
+    - darkTint: "#202020"
+      $name: Dark tint color
+      $description: "#RRGGBB color for Solid, Transparent, Acrylic and Modern Acrylic in the dark theme."
+  $name: Materials and Tint
+- hoverHighlight:
+    - highlightOpacity: 28
+      $name: Hover highlight opacity
+      $description: 1-100 for the custom highlight. Set to 0 to use the native highlight.
+    - highlightColor: auto
+      $name: Hover highlight color
+      $description: "#RRGGBB for both themes, or auto for the default light and dark colors. Applies only to the custom highlight."
+    - highlightRadius: 4
+      $name: Hover highlight corner radius
+      $description: Non-negative DIP, scaled with display DPI. Set to 0 for square corners.
+    - highlightInset: 0
+      $name: Hover highlight inset
+      $description: Non-negative DIP on all sides, scaled with display DPI. A large inset can hide the highlight.
+    - selectionFade: replay
+      $name: Menu item click animation
+      $description: Applies to modified menus only. Native can briefly show a black background; Replay fades a snapshot of the composited item. Menu opening animations are unchanged.
+      $options:
+      - native: Windows animation (may show black background)
+      - instant: Close immediately
+      - replay: Recreate fade animation
+  $name: Hover highlight
 - roundedCorners: true
   $name: Rounded corners
-  $description: Request small rounded corners for modified menus and file information tooltips.
+  $description: Request small rounded corners for modified menus and tooltips.
 - hideMenuBorder: true
   $name: Hide menu border
-  $description: Suppress the outline on modified menus and file information tooltips without changing their size.
-- styleWindowMenu: false
+  $description: Suppress the outline on modified menus and tooltips without changing their size.
+- styleWindowMenu: true
   $name: Apply material to title bar menu
   $description: Apply the same appearance and mouse click animation settings to File Explorer's title bar menu (right-click or Alt+Space).
-- styleFileInfoTips: false
+- styleFileInfoTips: true
   $name: Apply material to file information tooltips
-  $description: Use the menu material, tint, theme, corners and border setting for file-list and desktop icon tooltips. Other tooltips are unchanged.
+  $description: Use the menu material, tint, theme, corners and border setting for file-list and desktop icon tooltips.
+- styleNavigationTooltips: true
+  $name: Apply material to navigation pane label tooltips
+  $description: Style the full labels that appear when hovering over truncated item names in File Explorer's navigation pane. Other navigation and toolbar tooltips are unchanged.
 - repairIcons: true
   $name: Repair legacy icon transparency
   $description: Convert copied legacy RGB icons to premultiplied alpha without modifying the source bitmaps.
@@ -408,7 +432,10 @@ struct Settings {
     bool hideMenuBorder = false;
     bool styleWindowMenu = false;
     bool styleFileInfoTips = false;
+    bool styleNavigationTooltips = false;
     SelectionFade selectionFade = SelectionFade::Replay;
+
+    bool StyleTooltips() const { return styleFileInfoTips || styleNavigationTooltips; }
 };
 Settings
     g_settings{};  // Immutable while hooks are active; settings cause reload.
@@ -3165,7 +3192,7 @@ bool IsDesktopHost(HWND hwnd) {
 constexpr PCWSTR kInfoTipStateProperty = L"ExplorerTranslucentMenus.InfoTipState";
 UINT g_detachInfoTipMessage;
 
-HWND InfoTipFileView(HWND hwnd, bool& noCurrentTool) {
+HWND InfoTipSource(HWND hwnd, bool& noCurrentTool) {
     HWND owner = GetWindow(hwnd, GW_OWNER);
     if (GetWindowLongPtrW(hwnd, GWL_STYLE) & TTS_BALLOON)
         return nullptr;
@@ -3176,12 +3203,22 @@ HWND InfoTipFileView(HWND hwnd, bool& noCurrentTool) {
     }
     HWND target = (tool.uFlags & TTF_IDISHWND)
         ? reinterpret_cast<HWND>(tool.uId) : tool.hwnd;
-    if (GetWindowThreadProcessId(target, nullptr) != GetCurrentThreadId() ||
-        !WindowClassIs(GetAncestor(target, GA_PARENT), L"SHELLDLL_DefView"))
+    if (GetWindowThreadProcessId(target, nullptr) != GetCurrentThreadId())
         return nullptr;
 
     HWND root = GetAncestor(target, GA_ROOT);
     if (owner && owner != root)
+        return nullptr;
+
+    HWND parent = GetAncestor(target, GA_PARENT);
+    if (g_settings.styleNavigationTooltips && owner && IsWindowMenuOwner(owner) &&
+        WindowClassIs(parent, L"NamespaceTreeControl") &&
+        WindowClassIs(target, WC_TREEVIEWW) &&
+        !(GetWindowLongPtrW(target, GWL_STYLE) & TVS_INFOTIP) &&
+        TreeView_GetToolTips(target) == hwnd)
+        return target;
+
+    if (!g_settings.styleFileInfoTips || !WindowClassIs(parent, L"SHELLDLL_DefView"))
         return nullptr;
     if (owner && IsWindowMenuOwner(owner) && WindowClassIs(target, L"DirectUIHWND"))
         return target;
@@ -3255,7 +3292,7 @@ LRESULT CALLBACK InfoTipSubclass(HWND hwnd, UINT message, WPARAM wp, LPARAM lp,
     if (!detach && !hide && (!state || !state->busy) &&
         !g_stopping.load(std::memory_order_relaxed)) {
         bool noCurrentTool = false;
-        source = InfoTipFileView(hwnd, noCurrentTool);
+        source = InfoTipSource(hwnd, noCurrentTool);
         // Querying a control sends a synchronous message. Read the property
         // again in case that dispatch detached the subclass.
         auto* current = static_cast<InfoTipState*>(GetPropW(hwnd, kInfoTipStateProperty));
@@ -3305,8 +3342,10 @@ LRESULT CALLBACK InfoTipSubclass(HWND hwnd, UINT message, WPARAM wp, LPARAM lp,
                 !state->detached;
             state->busy = false;
             if (state->styled) {
-                ETM_LOG(L"File InfoTip hwnd=%p view=%p material=%s", hwnd, source,
-                        MaterialName(g_settings.material));
+                ETM_LOG(L"%s hwnd=%p view=%p material=%s",
+                        WindowClassIs(source, WC_TREEVIEWW) ? L"Navigation label tooltip"
+                                                           : L"File InfoTip",
+                        hwnd, source, MaterialName(g_settings.material));
             } else {
                 state->Reset();
                 state->source = source;  // Keep this presentation native.
@@ -3351,7 +3390,7 @@ BOOL CALLBACK VisitExplorerSurfaces(HWND hwnd, LPARAM attach) {
             WindhawkUtils::RemoveWindowSubclassFromAnyThread(
                 hwnd, WindowMenuOwnerSubclass);
     }
-    if (g_settings.styleFileInfoTips && IsLocalWindow(hwnd) &&
+    if (g_settings.StyleTooltips() && IsLocalWindow(hwnd) &&
         WindowClassIs(hwnd, TOOLTIPS_CLASSW)) {
         if (attach) {
             AttachInfoTip(hwnd);
@@ -3373,7 +3412,7 @@ HWND WINAPI CreateWindowExWHook(DWORD exStyle, PCWSTR className,
         (!IS_INTRESOURCE(className) &&
          !(g_settings.styleWindowMenu &&
            _wcsicmp(className, kExplorerWindowClass) == 0) &&
-         !(g_settings.styleFileInfoTips &&
+         !(g_settings.StyleTooltips() &&
            _wcsicmp(className, TOOLTIPS_CLASSW) == 0))) {
         [[clang::musttail]] return g_createWindowEx(
             exStyle, className, windowName, style, x, y, width, height, parent,
@@ -3389,7 +3428,7 @@ HWND WINAPI CreateWindowExWHook(DWORD exStyle, PCWSTR className,
         if (!g_stopping.load(std::memory_order_relaxed)) {
             if (g_settings.styleWindowMenu && IsWindowMenuOwner(hwnd))
                 AttachWindowMenuOwner(hwnd);
-            else if (g_settings.styleFileInfoTips && WindowClassIs(hwnd, TOOLTIPS_CLASSW))
+            else if (g_settings.StyleTooltips() && WindowClassIs(hwnd, TOOLTIPS_CLASSW))
                 AttachInfoTip(hwnd);
         }
         ReleaseSRWLockShared(&g_surfaceSubclassLock);
@@ -3414,7 +3453,7 @@ BOOL Wh_ModInit() {
         return FALSE;
     }
     g_settings.material =
-        ParseMaterial(WindhawkUtils::StringSetting::make(L"backgroundEffect"));
+        ParseMaterial(WindhawkUtils::StringSetting::make(L"materialsAndTint.backgroundEffect"));
     if (g_settings.material == Material::Native) {
         ETM_LOG(L"Native mode: no hooks registered, no window effects changed");
         return TRUE;
@@ -3437,7 +3476,7 @@ BOOL Wh_ModInit() {
         ETM_LOG(L"Menu theme identification unavailable");
         return FALSE;
     }
-    g_settings.tintOpacity = Wh_GetIntSetting(L"tintOpacity");
+    g_settings.tintOpacity = Wh_GetIntSetting(L"materialsAndTint.tintOpacity");
     HMODULE user = GetModuleHandleW(L"user32.dll");
     g_setComposition = reinterpret_cast<CompositionAttribute_t>(
         GetProcAddress(user, "SetWindowCompositionAttribute"));
@@ -3449,23 +3488,23 @@ BOOL Wh_ModInit() {
         return FALSE;
     }
     g_settings.lightTint = ParseRgbColor(
-        WindhawkUtils::StringSetting::make(L"lightTint"), RGB(245, 245, 245));
+        WindhawkUtils::StringSetting::make(L"materialsAndTint.lightTint"), RGB(245, 245, 245));
     g_settings.darkTint = ParseRgbColor(
-        WindhawkUtils::StringSetting::make(L"darkTint"), RGB(32, 32, 32));
-    auto themeSetting = WindhawkUtils::StringSetting::make(L"theme");
+        WindhawkUtils::StringSetting::make(L"materialsAndTint.darkTint"), RGB(32, 32, 32));
+    auto themeSetting = WindhawkUtils::StringSetting::make(L"materialsAndTint.theme");
     g_settings.theme = !_wcsicmp(themeSetting, L"dark")    ? 2
                        : !_wcsicmp(themeSetting, L"light") ? 1
                                                            : 0;
     g_settings.highlightOpacity =
-        ClampPercent(Wh_GetIntSetting(L"highlightOpacity"));
+        ClampPercent(Wh_GetIntSetting(L"hoverHighlight.highlightOpacity"));
     g_settings.highlightColor = ParseRgbColor(
-        WindhawkUtils::StringSetting::make(L"highlightColor"), CLR_INVALID);
-    int highlightRadius = Wh_GetIntSetting(L"highlightRadius");
-    int highlightInset = Wh_GetIntSetting(L"highlightInset");
+        WindhawkUtils::StringSetting::make(L"hoverHighlight.highlightColor"), CLR_INVALID);
+    int highlightRadius = Wh_GetIntSetting(L"hoverHighlight.highlightRadius");
+    int highlightInset = Wh_GetIntSetting(L"hoverHighlight.highlightInset");
     g_settings.highlightRadius = highlightRadius < 0 ? 0 : highlightRadius;
     g_settings.highlightInset = highlightInset < 0 ? 0 : highlightInset;
     g_settings.selectionFade = ParseSelectionFade(
-        WindhawkUtils::StringSetting::make(L"selectionFade"));
+        WindhawkUtils::StringSetting::make(L"hoverHighlight.selectionFade"));
     g_settings.repairIcons = Wh_GetIntSetting(L"repairIcons") != 0;
     g_settings.removeIconBackground =
         Wh_GetIntSetting(L"removeIconBackground") != 0;
@@ -3473,7 +3512,8 @@ BOOL Wh_ModInit() {
     g_settings.hideMenuBorder = Wh_GetIntSetting(L"hideMenuBorder") != 0;
     g_settings.styleWindowMenu = Wh_GetIntSetting(L"styleWindowMenu") != 0;
     g_settings.styleFileInfoTips = Wh_GetIntSetting(L"styleFileInfoTips") != 0;
-    if (g_settings.styleFileInfoTips) {
+    g_settings.styleNavigationTooltips = Wh_GetIntSetting(L"styleNavigationTooltips") != 0;
+    if (g_settings.StyleTooltips()) {
         g_detachInfoTipMessage =
             RegisterWindowMessageW(L"ExplorerTranslucentMenus.DetachInfoTip." WH_MOD_ID);
         if (!g_detachInfoTipMessage)
@@ -3509,13 +3549,14 @@ BOOL Wh_ModInit() {
                                         DwmSetWindowAttributeHook,
                                         &g_dwmSetWindowAttribute))
         return FALSE;
-    if ((g_settings.styleWindowMenu || g_settings.styleFileInfoTips) &&
+    if ((g_settings.styleWindowMenu || g_settings.StyleTooltips()) &&
         !WindhawkUtils::SetFunctionHook(CreateWindowExW, CreateWindowExWHook,
                                         &g_createWindowEx))
         return FALSE;
-    ETM_LOG(L"Initialized on Windows build %lu material=%s titleBarMenu=%d fileInfoTips=%d",
+    ETM_LOG(L"Initialized on Windows build %lu material=%s titleBarMenu=%d fileInfoTips=%d navigationTooltips=%d",
             version.dwBuildNumber, MaterialName(g_settings.material),
-            g_settings.styleWindowMenu, g_settings.styleFileInfoTips);
+            g_settings.styleWindowMenu, g_settings.styleFileInfoTips,
+            g_settings.styleNavigationTooltips);
     return TRUE;
 }
 
