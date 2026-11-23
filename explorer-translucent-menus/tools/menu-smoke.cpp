@@ -1029,6 +1029,63 @@ void CheckSelectionFade(HWND owner) {
     SetCursorPos(cursor.x, cursor.y);
 }
 
+bool probeShellText;
+bool sampledShellText;
+
+void CheckBufferedShellCaption(const DRAWITEMSTRUCT& item) {
+    if (sampledShellText)
+        return;
+    sampledShellText = true;
+    const int selected = etm::g_settings.theme;
+    const bool dark = selected ? selected == 2 : etm::SystemUsesDarkMenus();
+    HTHEME theme = OpenThemeData(nullptr, dark ? L"DarkMode::Menu" : L"Menu");
+    Check(theme != nullptr, "native Shell caption theme available");
+    if (!theme)
+        return;
+    constexpr int width = 220, height = 45;
+    for (bool related : {true, false}) {
+        etm::IconSurface surface;
+        surface.dc = CreateCompatibleDC(related ? item.hDC : nullptr);
+        BITMAPINFO info{};
+        info.bmiHeader = {sizeof(BITMAPINFOHEADER), width, -height, 1, 32, BI_RGB};
+        void* bits = nullptr;
+        surface.bitmap = CreateDIBSection(nullptr, &info, DIB_RGB_COLORS, &bits,
+                                          nullptr, 0);
+        if (surface.dc && surface.bitmap)
+            surface.old = SelectObject(surface.dc, surface.bitmap);
+        Check(bits && surface.old && surface.old != HGDI_ERROR,
+              "caption test has a real compositing surface");
+        if (!bits || !surface.old || surface.old == HGDI_ERROR)
+            continue;
+        SelectObject(surface.dc, GetStockObject(DEFAULT_GUI_FONT));
+        RECT bounds{0, 0, width, height};
+        // Some customizations supply a text color independently of the theme.
+        DTTOPTS options{sizeof(options), DTT_COMPOSITED | DTT_CALLBACK | DTT_TEXTCOLOR};
+        options.crText = dark ? RGB(0, 0, 0) : RGB(255, 255, 255);
+        options.pfnDrawTextCallback = [](HDC dc, LPWSTR text, int len, LPRECT rect,
+                                         UINT flags, LPARAM) -> int {
+            return DrawTextW(dc, text, len, rect, flags);
+        };
+        HRESULT drawn = DrawThemeTextEx(theme, surface.dc, etm::kPopupItemFocusable,
+            MPI_NORMAL, L"Buffered Shell caption", -1, DT_SINGLELINE | DT_VCENTER,
+            &bounds, &options);
+        GdiFlush();
+        bool expectLight = related && selected && etm::g_settings.matchMenuForeground
+            ? dark : !dark;
+        bool contrasting = false;
+        for (int i = 0; i < width * height && !contrasting; ++i) {
+            DWORD pixel = static_cast<DWORD*>(bits)[i];
+            unsigned green = (pixel >> 8) & 255;
+            contrasting = (pixel >> 24) > 220 &&
+                          (expectLight ? green > 180 : green < 65);
+        }
+        Check(SUCCEEDED(drawn) && contrasting,
+              related ? "Shell's composited caption respects the foreground option"
+                      : "unrelated memory DC retains its native caption color");
+    }
+    CloseThemeData(theme);
+}
+
 LRESULT CALLBACK OwnerProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     if (selectionFixtureMode && msg == WM_ERASEBKGND) {
         HDC dc = reinterpret_cast<HDC>(wp);
@@ -1119,6 +1176,8 @@ LRESULT CALLBACK OwnerProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 SelectObject(source, saved); DeleteDC(source);
             }
             DrawTextW(item->hDC, previewMode ? L"Legacy RGB icon" : L"Shell DrawTextW / \u81ea\u7ed8", -1, &bounds, DT_SINGLELINE | DT_VCENTER);
+            if (probeShellText)
+                CheckBufferedShellCaption(*item);
             CloseThemeData(theme);
             return TRUE;
         }
@@ -2230,6 +2289,29 @@ void CheckInfoTipFade() {
     ReleaseActCtx(context);
 }
 
+void CheckShellText(HWND owner) {
+    HMENU menu = CreatePopupMenu();
+    AppendMenuW(menu, MF_OWNERDRAW, 44, reinterpret_cast<PCWSTR>(1));
+    SetPropW(owner, L"ImmersiveContextMenuArray_1-44", reinterpret_cast<HANDLE>(1));
+    shellFixture = true;
+    const int systemTheme = etm::SystemUsesDarkMenus() ? 2 : 1;
+    SetForegroundWindow(owner);
+    struct Case { int theme; bool match; };
+    for (Case test : {Case{systemTheme, true}, Case{3 - systemTheme, true},
+                      Case{3 - systemTheme, false}, Case{0, true}}) {
+        etm::g_settings.theme = test.theme;
+        etm::g_settings.matchMenuForeground = test.match;
+        sampledShellText = false;
+        SetTimer(owner, 2, 400, EndReplayWarmup);
+        TrackPopupMenuEx(menu, TPM_NONOTIFY | TPM_NOANIMATION, 260, 240, owner, nullptr);
+        KillTimer(owner, 2);
+        Check(sampledShellText, "the native popup dispatched owner-drawn item paint");
+    }
+    shellFixture = false;
+    RemovePropW(owner, L"ImmersiveContextMenuArray_1-44");
+    DestroyMenu(menu);
+}
+
 int main(int argc, char** argv) {
     setvbuf(stdout, nullptr, _IONBF, 0);
     bool preview = argc > 1 && strcmp(argv[1], "--preview") == 0;
@@ -2261,6 +2343,7 @@ int main(int argc, char** argv) {
     bool probeWindowMenu = argc > 1 && strcmp(argv[1], "--probe-window-menu") == 0;
     bool probeScrollMenu = argc > 1 && strcmp(argv[1], "--probe-scroll-menu") == 0;
     bool probeInfoTipFade = argc > 1 && strcmp(argv[1], "--probe-infotip-fade") == 0;
+    probeShellText = argc > 1 && strcmp(argv[1], "--probe-shell-text") == 0;
     highlightGeometryOnly = probeHighlight;
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     previewMode = preview;
@@ -2294,6 +2377,10 @@ int main(int argc, char** argv) {
     TEST_HOOK(DrawThemeText, ObserveText, etm::g_drawThemeText);
     TEST_HOOK(DrawThemeTextEx, etm::DrawThemeTextExHook, etm::g_drawThemeTextEx);
     TEST_HOOK(DrawTextW, etm::DrawTextHook, etm::g_drawText);
+    if (probeShellText) {
+        TEST_HOOK(CreateCompatibleDC, etm::CreateCompatibleDCHook, etm::g_createCompatibleDC);
+        TEST_HOOK(DeleteDC, etm::DeleteDCHook, etm::g_deleteDC);
+    }
     TEST_HOOK(FillRect, etm::FillRectHook, etm::g_fillRect);
     TEST_HOOK(BitBlt, etm::BitBltHook, etm::g_bitBlt);
     TEST_HOOK(StretchBlt, etm::StretchBltHook, etm::g_stretchBlt);
@@ -2316,7 +2403,7 @@ int main(int argc, char** argv) {
         printf("Failures: %d\n", failures);
         return result;
     }
-    if (!selectionFade && !probeHighlight && !probeReplayMask && !probeScrollMenu)
+    if (!selectionFade && !probeHighlight && !probeReplayMask && !probeScrollMenu && !probeShellText)
         CheckNativeBypass();
 
     WNDCLASSW wc{};
@@ -2328,7 +2415,7 @@ int main(int argc, char** argv) {
     HWND owner = CreateWindowW(wc.lpszClassName, L"Isolated menu test - no Explorer changes",
         WS_OVERLAPPEDWINDOW | WS_VISIBLE, 160, 140, 680, 440, nullptr, nullptr, wc.hInstance, nullptr);
     Check(!etm::IsClassicPopup(owner), "ordinary/modern window class excluded");
-    if (!selectionFade && !probeHighlight && !probeReplayMask && !probeScrollMenu)
+    if (!selectionFade && !probeHighlight && !probeReplayMask && !probeScrollMenu && !probeShellText)
         CheckLateCtrlBypass(owner);
 
     HMENU child = CreatePopupMenu();
@@ -2339,7 +2426,9 @@ int main(int argc, char** argv) {
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING | MF_CHECKED, 44, L"Checked command");
     Check(etm::IsSupportedMenu(menu, owner), "standard menu recognized");
-    if (probeScrollMenu) {
+    if (probeShellText) {
+        CheckShellText(owner);
+    } else if (probeScrollMenu) {
         CheckScrollMenu(owner);
     } else if (selectionFade) {
         CheckSelectionFade(owner);

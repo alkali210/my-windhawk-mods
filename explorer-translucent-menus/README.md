@@ -50,6 +50,13 @@ a menu.
 Tint opacity changes the material, not text or icons. Theme selection controls
 the light or dark palette.
 
+**Match text and symbols to menu theme** is on by default. When **Menu theme**
+is explicitly set to Light or Dark, text, submenu arrows, checkmarks, and
+radio dots use that palette even if another customization mixes light and
+dark foreground colors. This includes Shell-drawn captions on the desktop
+context menu. **Follow Windows** or turning this option off keeps native
+foreground colors. Menu item icons are not recolored.
+
 ## Hover highlight
 
 **Hover highlight color** accepts `#RRGGBB` (for example, `#FF6A00`).
@@ -165,6 +172,7 @@ To continue using those mods in other applications while avoiding their Explorer
 exclude `explorer.exe` from their targets.
 
 This mod leaves Explorer's main window backdrop untouched and can complement ExplorerBlurMica.
+With ExplorerBlurMica enabled, menu text and symbols may use different palettes; select **Light** or **Dark** with **Match text and symbols to menu theme** enabled to use one palette.
 
 Compatible with WinUI Context Menu Animation (disable Fade-in and enable
 Translucent Windows compatibility mode).

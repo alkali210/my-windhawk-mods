@@ -4,7 +4,7 @@
 // @name:zh-CN      Explorer 上下文菜单半透明
 // @description     Translucent materials and optional borderless classic context menus for File Explorer
 // @description:zh-CN 对 Explorer 经典上下文菜单应用半透明材质和可选无边框
-// @version         1.3.1
+// @version         1.3.2
 // @author          alkali210
 // @github          https://github.com/alkali210
 // @include         explorer.exe
@@ -75,6 +75,13 @@ a menu.
 
 Tint opacity changes the material, not text or icons. Theme selection controls
 the light or dark palette.
+
+**Match text and symbols to menu theme** is on by default. When **Menu theme**
+is explicitly set to Light or Dark, text, submenu arrows, checkmarks, and
+radio dots use that palette even if another customization mixes light and
+dark foreground colors. This includes Shell-drawn captions on the desktop
+context menu. **Follow Windows** or turning this option off keeps native
+foreground colors. Menu item icons are not recolored.
 
 ## Hover highlight
 
@@ -191,6 +198,7 @@ To continue using those mods in other applications while avoiding their Explorer
 exclude `explorer.exe` from their targets.
 
 This mod leaves Explorer's main window backdrop untouched and can complement ExplorerBlurMica.
+If the selected menu theme is opposite to the system color theme, and explorerblurmica is used, then a mismatch between menu symbols (arrows, dots) and text may be observed in the explorer main window.
 
 Compatible with WinUI Context Menu Animation (disable Fade-in and enable
 Translucent Windows compatibility mode).
@@ -256,6 +264,9 @@ This implementation is distributed under GPL-3.0-or-later.
       - auto: Follow Windows
       - light: Light
       - dark: Dark
+    - matchMenuForeground: true
+      $name: Match text and symbols to menu theme
+      $description: Use the selected Light or Dark palette for menu text, submenu arrows, checkmarks, and radio dots. Follow Windows keeps native colors. Menu icons are unchanged.
     - tintOpacity: 35
       $name: Tint opacity
       $description: 0-100. Applies to Acrylic and Transparent.
@@ -423,6 +434,7 @@ struct Settings {
     COLORREF lightTint = RGB(245, 245, 245);
     COLORREF darkTint = RGB(32, 32, 32);
     int theme = 0;  // 0=auto, 1=light, 2=dark
+    bool matchMenuForeground = true;
     int highlightOpacity = 28;
     COLORREF highlightColor = CLR_INVALID;  // Default color for the popup theme.
     int highlightRadius = 4;
@@ -435,6 +447,7 @@ struct Settings {
     bool styleNavigationTooltips = false;
     SelectionFade selectionFade = SelectionFade::Replay;
 
+    bool MatchMenuForeground() const { return matchMenuForeground && theme != 0; }
     bool StyleTooltips() const { return styleFileInfoTips || styleNavigationTooltips; }
 };
 Settings
@@ -455,6 +468,8 @@ decltype(&DrawThemeBackground) g_drawThemeBackground = nullptr;
 decltype(&DrawThemeBackgroundEx) g_drawThemeBackgroundEx = nullptr;
 decltype(&DrawThemeText) g_drawThemeText = nullptr;
 decltype(&DrawThemeTextEx) g_drawThemeTextEx = nullptr;
+decltype(&CreateCompatibleDC) g_createCompatibleDC = nullptr;
+decltype(&DeleteDC) g_deleteDC = nullptr;
 decltype(&DrawTextW) g_drawText = nullptr;
 decltype(&FillRect) g_fillRect = nullptr;
 decltype(&BitBlt) g_bitBlt = nullptr;
@@ -1096,9 +1111,7 @@ bool EffectsAllowed(PCWSTR* reason = nullptr) {
     return enabled ? true : reject(L"transparency disabled");
 }
 
-bool UsesDarkMenus() {
-    if (g_settings.theme)
-        return g_settings.theme == 2;
+bool SystemUsesDarkMenus() {
     DWORD light = 1;
     DWORD size = sizeof(light);
     RegGetValueW(
@@ -1106,6 +1119,10 @@ bool UsesDarkMenus() {
         L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
         L"AppsUseLightTheme", RRF_RT_REG_DWORD, nullptr, &light, &size);
     return !light;
+}
+
+bool UsesDarkMenus() {
+    return g_settings.theme ? g_settings.theme == 2 : SystemUsesDarkMenus();
 }
 
 // Only recognize the shell's own owner-draw PROPERTY. Never dereference its
@@ -2098,6 +2115,13 @@ LRESULT CALLBACK MenuPopupSubclass(HWND hwnd,
     return DefSubclassProc(hwnd, message, wParam, lParam);
 }
 
+struct ShellTextPaint {
+    HDC target = nullptr;
+    HDC compatibleDCs[4]{};
+    bool dark = false;
+};
+thread_local ShellTextPaint* t_shellTextPaint = nullptr;
+
 LRESULT CALLBACK MenuOwnerSubclass(HWND hwnd,
                                    UINT message,
                                    WPARAM wParam,
@@ -2111,11 +2135,15 @@ LRESULT CALLBACK MenuOwnerSubclass(HWND hwnd,
         MenuScope* scope;
         HWND oldWindow;
         const DRAWITEMSTRUCT* oldItem;
+        ShellTextPaint* oldTextPaint;
         ~DrawingContext() {
             scope->paintingWindow = oldWindow;
             scope->drawingItem = oldItem;
+            t_shellTextPaint = oldTextPaint;
         }
-    } context{scope, scope->paintingWindow, scope->drawingItem};
+    } context{scope, scope->paintingWindow, scope->drawingItem, t_shellTextPaint};
+    ShellTextPaint textPaint;
+    t_shellTextPaint = nullptr;
     scope->paintingWindow = nullptr;
     scope->drawingItem = nullptr;
     if (message == WM_DRAWITEM && lParam) {
@@ -2129,6 +2157,11 @@ LRESULT CALLBACK MenuOwnerSubclass(HWND hwnd,
                     scope->paintingWindow = popup.hwnd;
                     scope->drawingItem =
                         &item;  // Valid until DefSubclassProc returns.
+                    if (g_settings.MatchMenuForeground()) {
+                        textPaint.target = item.hDC;
+                        textPaint.dark = popup.dark;
+                        t_shellTextPaint = &textPaint;
+                    }
                     break;
                 }
             }
@@ -2153,14 +2186,19 @@ bool MatchPaintTarget(const MenuScope& scope, HDC dc, HWND& hwnd,
 
 // Require a positive DC association, never the last observed popup. A memory
 // DC must match the exact synchronous Shell or native popup drawing target.
-Popup* DrawingPopupForDC(HDC dc) {
+Popup* DrawingPopupForDC(HDC dc, const DRAWITEMSTRUCT** drawItem = nullptr) {
     MenuScope* scope = t_scope;
     if (!scope || !scope->allowed || g_stopping.load(std::memory_order_relaxed))
         return nullptr;
     HWND hwnd;
-    const DRAWITEMSTRUCT* item;
-    if (!MatchPaintTarget(*scope, dc, hwnd, item))
+    const DRAWITEMSTRUCT* item = nullptr;
+    if (!MatchPaintTarget(*scope, dc, hwnd, item)) {
+        if (drawItem)
+            return nullptr;
         hwnd = WindowFromDC(dc);
+    } else if (drawItem) {
+        *drawItem = item;
+    }
     if (!hwnd || !IsClassicPopup(hwnd))
         return nullptr;
     Popup* popup = scope->Find(hwnd);
@@ -2169,15 +2207,60 @@ Popup* DrawingPopupForDC(HDC dc) {
                : nullptr;
 }
 
+HDC WINAPI CreateCompatibleDCHook(HDC source) {
+    auto* paint = t_shellTextPaint;
+    // Shell creates a DIB DC from the exact WM_DRAWITEM DC, not a UxTheme
+    // buffered paint from that DC. Never infer ownership from a generic memory DC.
+    if (!paint || paint->target != source || t_textDepth ||
+        g_stopping.load(std::memory_order_relaxed)) {
+        [[clang::musttail]] return g_createCompatibleDC(source);
+    }
+    for (HDC& dc : paint->compatibleDCs) {
+        if (!dc) {
+            CallGuard call;
+            dc = g_createCompatibleDC(source);
+            return dc;
+        }
+    }
+    [[clang::musttail]] return g_createCompatibleDC(source);
+}
+
+BOOL WINAPI DeleteDCHook(HDC dc) {
+    if (auto* paint = t_shellTextPaint) {
+        for (HDC& known : paint->compatibleDCs) {
+            if (known && known == dc) {
+                CallGuard call;
+                BOOL deleted = g_deleteDC(dc);
+                if (deleted)
+                    known = nullptr;
+                return deleted;
+            }
+        }
+    }
+    [[clang::musttail]] return g_deleteDC(dc);
+}
+
+const ShellTextPaint* ShellTextPaintForDC(HDC dc) {
+    const auto* paint = t_shellTextPaint;
+    if (paint && dc && !t_textDepth &&
+        !g_stopping.load(std::memory_order_relaxed)) {
+        for (HDC known : paint->compatibleDCs) {
+            if (known == dc)
+                return paint;
+        }
+    }
+    return nullptr;
+}
+
+bool IsMenuTheme(HTHEME theme) {
+    wchar_t name[64]{};
+    return SUCCEEDED(g_getThemeClass(theme, name, ARRAYSIZE(name))) &&
+           _wcsicmp(name, L"Menu") == 0;
+}
+
 Popup* DrawingPopup(HTHEME theme, HDC dc) {
     Popup* popup = DrawingPopupForDC(dc);
-    if (!popup)
-        return nullptr;
-    wchar_t name[64]{};
-    if (FAILED(g_getThemeClass(theme, name, ARRAYSIZE(name))) ||
-        _wcsicmp(name, L"Menu") != 0)
-        return nullptr;
-    return popup;
+    return popup && IsMenuTheme(theme) ? popup : nullptr;
 }
 
 struct IconSurface {
@@ -2440,6 +2523,28 @@ bool PaintInfoTipBackground(HTHEME theme, HDC dc, int part, int state,
                   area.bottom - area.top, BLACKNESS) != FALSE;
 }
 
+COLORREF MenuTextColor(bool dark, bool disabled) {
+    return dark ? (disabled ? RGB(155, 155, 155) : RGB(245, 245, 245))
+                : (disabled ? RGB(120, 120, 120) : RGB(25, 25, 25));
+}
+
+void SetMenuTextColor(DTTOPTS& options, bool dark, int state) {
+    options.dwFlags |= DTT_TEXTCOLOR;
+    options.crText = MenuTextColor(dark, state == MPI_DISABLED || state == MPI_DISABLEDHOT);
+}
+
+HTHEME MenuBackgroundTheme(HTHEME theme, HDC dc, int part) {
+    if (part < MENU_POPUPCHECK || part > kPopupItemFocusable)
+        return theme;
+    const Popup* popup = DrawingPopup(theme, dc);
+    if (!popup)
+        return theme;
+    if (part == MENU_POPUPCHECK || part == MENU_POPUPCHECKBACKGROUND ||
+        part == MENU_POPUPSUBMENU)
+        return g_settings.MatchMenuForeground() ? popup->palette : theme;
+    return popup->palette;
+}
+
 HRESULT WINAPI DrawThemeBackgroundHook(HTHEME theme,
                                        HDC dc,
                                        int part,
@@ -2457,11 +2562,8 @@ HRESULT WINAPI DrawThemeBackgroundHook(HTHEME theme,
         return S_OK;
     if (ClearBackground(theme, dc, part, state, rect, clip))
         return S_OK;
-    if (part >= MENU_POPUPCHECK && part <= kPopupItemFocusable) {
-        if (Popup* popup = DrawingPopup(theme, dc))
-            theme = popup->palette;
-    }
-    return g_drawThemeBackground(theme, dc, part, state, rect, clip);
+    return g_drawThemeBackground(MenuBackgroundTheme(theme, dc, part), dc,
+                                 part, state, rect, clip);
 }
 
 HRESULT WINAPI DrawThemeBackgroundExHook(HTHEME theme,
@@ -2493,14 +2595,11 @@ HRESULT WINAPI DrawThemeBackgroundExHook(HTHEME theme,
             theme, dc, part, state, rect,
             opts && (opts->dwFlags & DTBG_CLIPRECT) ? &opts->rcClip : nullptr))
         return S_OK;
-    if (part >= MENU_POPUPCHECK && part <= kPopupItemFocusable) {
-        if (Popup* popup = DrawingPopup(theme, dc))
-            theme = popup->palette;
-    }
-    return g_drawThemeBackgroundEx(theme, dc, part, state, rect, opts);
+    return g_drawThemeBackgroundEx(MenuBackgroundTheme(theme, dc, part), dc,
+                                   part, state, rect, opts);
 }
 
-bool DrawCompositedText(HTHEME theme,
+bool DrawCompositedText(HTHEME& theme,
                         HDC dc,
                         int part,
                         int state,
@@ -2509,15 +2608,31 @@ bool DrawCompositedText(HTHEME theme,
                         DWORD flags,
                         RECT* rect,
                         const DTTOPTS* options,
+                        bool composite,
                         HRESULT* result) {
     if (!rect || IsRectEmpty(rect) || (flags & DT_CALCRECT) ||
         (part != MENU_POPUPITEM && part != kPopupItemFocusable) ||
         (options && (options->dwSize != sizeof(*options) ||
-                     (options->dwFlags & (DTT_CALCRECT | DTT_CALLBACK)))))
+                     (options->dwFlags & DTT_CALCRECT))))
         return false;
-    Popup* popup = DrawingPopup(theme, dc);
+    const Popup* popup = DrawingPopup(theme, dc);
     if (!popup)
         return false;
+    const bool matching = g_settings.MatchMenuForeground();
+    if (matching)
+        theme = popup->palette;
+    if (!composite)
+        return false;
+    if (options && (options->dwFlags & DTT_CALLBACK)) {
+        if (!matching)
+            return false;
+        DTTOPTS adjusted = *options;
+        SetMenuTextColor(adjusted, popup->dark, state);
+        TextGuard guard;
+        *result = g_drawThemeTextEx(theme, dc, part, state, text, length,
+                                    flags, rect, &adjusted);
+        return true;
+    }
     TextGuard textGuard;
     // Top-down DIB is required by DTT_COMPOSITED. Clear only the temporary
     // buffer; EndBufferedPaint alpha-blends the glyphs over the existing menu.
@@ -2534,11 +2649,9 @@ bool DrawCompositedText(HTHEME theme,
     if (options)
         opts = *options;
     opts.dwSize = sizeof(opts);
-    opts.dwFlags |= DTT_COMPOSITED | DTT_TEXTCOLOR;
-    bool disabled = state == MPI_DISABLED || state == MPI_DISABLEDHOT;
-    opts.crText = popup->dark
-                      ? (disabled ? RGB(155, 155, 155) : RGB(245, 245, 245))
-                      : (disabled ? RGB(120, 120, 120) : RGB(25, 25, 25));
+    opts.dwFlags |= DTT_COMPOSITED;
+    if (matching)
+        SetMenuTextColor(opts, popup->dark, state);
     HGDIOBJ font = GetCurrentObject(dc, OBJ_FONT);
     if (font)
         SelectObject(bufferDC, font);
@@ -2565,8 +2678,8 @@ HRESULT WINAPI DrawThemeTextHook(HTHEME theme,
     CallGuard call;
     RECT bounds = rect ? *rect : RECT{};
     HRESULT result;
-    if (!flags2 && DrawCompositedText(theme, dc, part, state, text, length,
-                                      flags, &bounds, nullptr, &result))
+    if (DrawCompositedText(theme, dc, part, state, text, length,
+                           flags, &bounds, nullptr, !flags2, &result))
         return result;
     return g_drawThemeText(theme, dc, part, state, text, length, flags, flags2,
                            rect);
@@ -2586,9 +2699,23 @@ HRESULT WINAPI DrawThemeTextExHook(HTHEME theme,
             theme, dc, part, state, text, length, flags, rect, options);
     }
     CallGuard call;
+    // Explorer owner-draw composites captions into its own DIB. Change the
+    // color there, retaining its callback, font and alpha blend.
+    const auto* paint = ShellTextPaintForDC(dc);
+    if (paint && !(flags & DT_CALCRECT) &&
+        (part == MENU_POPUPITEM || part == kPopupItemFocusable) &&
+        options && options->dwSize == sizeof(*options) &&
+        (options->dwFlags & DTT_COMPOSITED) && !(options->dwFlags & DTT_CALCRECT) &&
+        IsMenuTheme(theme)) {
+        DTTOPTS adjusted = *options;
+        SetMenuTextColor(adjusted, paint->dark, state);
+        TextGuard guard;
+        return g_drawThemeTextEx(theme, dc, part, state, text, length, flags, rect,
+                                 &adjusted);
+    }
     HRESULT result;
     if (DrawCompositedText(theme, dc, part, state, text, length, flags, rect,
-                           options, &result))
+                           options, true, &result))
         return result;
     return g_drawThemeTextEx(theme, dc, part, state, text, length, flags, rect,
                              options);
@@ -2949,18 +3076,17 @@ DrawTextHook(HDC dc, PCWSTR text, int length, RECT* rect, UINT flags) {
         state = TTSS_NORMAL;
         color = paint->dark ? RGB(245, 245, 245) : RGB(25, 25, 25);
     } else {
-        Popup* popup = t_scope && t_scope->drawingItem &&
-                               t_scope->drawingItem->hDC == dc
-                           ? DrawingPopupForDC(dc) : nullptr;
-        if (!popup)
+        const DRAWITEMSTRUCT* item;
+        const bool matching = g_settings.MatchMenuForeground();
+        const Popup* popup = DrawingPopupForDC(dc, &item);
+        if (!popup || !item ||
+            (!matching && item != t_scope->drawingItem))
             return g_drawText(dc, text, length, rect, flags);
-        bool disabled = t_scope->drawingItem->itemState & (ODS_DISABLED | ODS_GRAYED);
+        bool disabled = item->itemState & (ODS_DISABLED | ODS_GRAYED);
         theme = popup->palette;
         part = MENU_POPUPITEM;
         state = disabled ? MPI_DISABLED : MPI_NORMAL;
-        color = popup->dark
-                    ? (disabled ? RGB(155, 155, 155) : RGB(245, 245, 245))
-                    : (disabled ? RGB(120, 120, 120) : RGB(25, 25, 25));
+        color = matching ? MenuTextColor(popup->dark, disabled) : GetTextColor(dc);
     }
 
     TextGuard textGuard;
@@ -3495,6 +3621,8 @@ BOOL Wh_ModInit() {
     g_settings.theme = !_wcsicmp(themeSetting, L"dark")    ? 2
                        : !_wcsicmp(themeSetting, L"light") ? 1
                                                            : 0;
+    g_settings.matchMenuForeground =
+        Wh_GetIntSetting(L"materialsAndTint.matchMenuForeground") != 0;
     g_settings.highlightOpacity =
         ClampPercent(Wh_GetIntSetting(L"hoverHighlight.highlightOpacity"));
     g_settings.highlightColor = ParseRgbColor(
@@ -3543,6 +3671,11 @@ BOOL Wh_ModInit() {
                                         &g_stretchBlt) ||
         !WindhawkUtils::SetFunctionHook(AlphaBlend, AlphaBlendHook,
                                         &g_alphaBlend))
+        return FALSE;
+    if (g_settings.MatchMenuForeground() &&
+        (!WindhawkUtils::SetFunctionHook(CreateCompatibleDC, CreateCompatibleDCHook,
+                                         &g_createCompatibleDC) ||
+         !WindhawkUtils::SetFunctionHook(DeleteDC, DeleteDCHook, &g_deleteDC)))
         return FALSE;
     if (g_settings.hideMenuBorder &&
         !WindhawkUtils::SetFunctionHook(DwmSetWindowAttribute,
