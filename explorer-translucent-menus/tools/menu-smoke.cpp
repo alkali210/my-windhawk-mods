@@ -1043,7 +1043,16 @@ void CheckBufferedShellCaption(const DRAWITEMSTRUCT& item) {
     if (!theme)
         return;
     constexpr int width = 220, height = 45;
-    for (bool related : {true, false}) {
+    for (int pass = 0; pass < 3; ++pass) {
+        const bool related = pass != 1;
+        const bool disabled = pass == 0;
+        etm::IconSurface scratch[6];
+        if (pass == 2) {
+            for (auto& surface : scratch) {
+                surface.dc = CreateCompatibleDC(item.hDC);
+                Check(surface.dc != nullptr, "non-caption DC stays live through caption paint");
+            }
+        }
         etm::IconSurface surface;
         surface.dc = CreateCompatibleDC(related ? item.hDC : nullptr);
         BITMAPINFO info{};
@@ -1062,6 +1071,10 @@ void CheckBufferedShellCaption(const DRAWITEMSTRUCT& item) {
         // Some customizations supply a text color independently of the theme.
         DTTOPTS options{sizeof(options), DTT_COMPOSITED | DTT_CALLBACK | DTT_TEXTCOLOR};
         options.crText = dark ? RGB(0, 0, 0) : RGB(255, 255, 255);
+        if (disabled) {
+            options.dwFlags |= DTT_STATEID;
+            options.iStateId = MPI_DISABLED;
+        }
         options.pfnDrawTextCallback = [](HDC dc, LPWSTR text, int len, LPRECT rect,
                                          UINT flags, LPARAM) -> int {
             return DrawTextW(dc, text, len, rect, flags);
@@ -1070,18 +1083,24 @@ void CheckBufferedShellCaption(const DRAWITEMSTRUCT& item) {
             MPI_NORMAL, L"Buffered Shell caption", -1, DT_SINGLELINE | DT_VCENTER,
             &bounds, &options);
         GdiFlush();
-        bool expectLight = related && selected && etm::g_settings.matchMenuForeground
-            ? dark : !dark;
+        const bool matching = related && selected && etm::g_settings.matchMenuForeground;
+        const unsigned expected = matching
+            ? (dark ? (disabled ? 155 : 245) : (disabled ? 120 : 25))
+            : (dark ? 0 : 255);
         bool contrasting = false;
         for (int i = 0; i < width * height && !contrasting; ++i) {
             DWORD pixel = static_cast<DWORD*>(bits)[i];
             unsigned green = (pixel >> 8) & 255;
-            contrasting = (pixel >> 24) > 220 &&
-                          (expectLight ? green > 180 : green < 65);
+            unsigned alpha = pixel >> 24;
+            if (alpha > 220) {
+                unsigned color = (green * 255 + alpha / 2) / alpha;
+                contrasting = color + 3 >= expected && color <= expected + 3;
+            }
         }
         Check(SUCCEEDED(drawn) && contrasting,
-              related ? "Shell's composited caption respects the foreground option"
-                      : "unrelated memory DC retains its native caption color");
+              !related ? "unrelated memory DC retains its native caption color"
+                  : disabled ? "Shell caption honors DTT_STATEID for disabled text"
+                             : "Shell caption still matches with six other live DCs");
     }
     CloseThemeData(theme);
 }
@@ -1795,6 +1814,55 @@ WPARAM systemCommand;
 LPARAM systemCommandPoint;
 unsigned windowMenuEdgeContrast;
 bool windowMenuHighlight;
+bool probeNativeSystemGlyphs;
+bool sampledNativeSystemGlyphs;
+
+void CheckNativeSystemGlyphs(HWND hwnd) {
+    auto* scope = etm::t_scope;
+    auto* popup = scope ? scope->Find(hwnd) : nullptr;
+    Check(popup && popup->active, "the styled system menu is active");
+    if (!popup || !popup->active)
+        return;
+    sampledNativeSystemGlyphs = true;
+    HTHEME native = OpenThemeData(hwnd, popup->dark ? L"Menu" : L"DarkMode::Menu");
+    constexpr int size = 32;
+    etm::IconSurface surface;
+    surface.dc = CreateCompatibleDC(nullptr);
+    BITMAPINFO info{};
+    info.bmiHeader = {sizeof(BITMAPINFOHEADER), size, -size, 1, 32, BI_RGB};
+    void* bits = nullptr;
+    surface.bitmap = CreateDIBSection(nullptr, &info, DIB_RGB_COLORS, &bits, nullptr, 0);
+    if (surface.dc && surface.bitmap)
+        surface.old = SelectObject(surface.dc, surface.bitmap);
+    bool ready = native && bits && surface.old && surface.old != HGDI_ERROR;
+    Check(ready, "system glyph comparison surface and theme available");
+    if (ready) {
+        const etm::UahPaintTarget target{hwnd, surface.dc, nullptr};
+        const auto* previous = scope->uahPaint;
+        scope->uahPaint = &target;
+        const RECT rect{0, 0, size, size};
+        DWORD baseline[size * size];
+        for (int part : {MENU_SYSTEMCLOSE, MENU_SYSTEMMINIMIZE,
+                         MENU_SYSTEMMAXIMIZE, MENU_SYSTEMRESTORE}) {
+            memset(bits, 0, sizeof(baseline));
+            HRESULT original = etm::g_drawThemeBackground(native, surface.dc, part, 1, &rect, nullptr);
+            GdiFlush();
+            memcpy(baseline, bits, sizeof(baseline));
+            memset(bits, 0, sizeof(baseline));
+            HRESULT rendered = DrawThemeBackgroundEx(native, surface.dc, part, 1, &rect, nullptr);
+            GdiFlush();
+            bool hasInk = false;
+            for (DWORD pixel : baseline)
+                hasInk |= pixel != 0;
+            Check(hasInk && SUCCEEDED(original) && SUCCEEDED(rendered) &&
+                  memcmp(baseline, bits, sizeof(baseline)) == 0,
+                  "system command glyph retains the native palette with matching off");
+        }
+        scope->uahPaint = previous;
+    }
+    if (native)
+        CloseThemeData(native);
+}
 
 LRESULT CALLBACK ObserveWindowMenuItem(int code, WPARAM wp, LPARAM lp) {
     if (code == HC_ACTION) {
@@ -1857,6 +1925,8 @@ void CALLBACK SampleWindowMenu(HWND owner, UINT, UINT_PTR timer, DWORD) {
                                   GetGValue(hot) > GetRValue(hot) + 45;
         }
         ReleaseDC(nullptr, screen);
+        if (probeNativeSystemGlyphs)
+            CheckNativeSystemGlyphs(popup);
         if (windowMenuSelect && !IsRectEmpty(&windowMenuItem)) {
             if (windowMenuStage++ == 0) {
                 fade.row = windowMenuItem;
@@ -1971,7 +2041,7 @@ LRESULT CALLBACK WindowMenuFixtureProc(HWND hwnd, UINT message, WPARAM wp, LPARA
     return OwnerProc(hwnd, message, wp, lp);
 }
 
-int RunWindowMenuProbe() {
+int RunWindowMenuProbe(bool glyphsOnly) {
     selectionFixtureMode = true;
     etm::g_settings.styleWindowMenu = true;
     etm::g_settings.theme = 1;
@@ -1995,12 +2065,24 @@ int RunWindowMenuProbe() {
     HWND existing = create();
     if (!existing)
         return 1;
-    CheckWindowMenu(existing, false, false);
+    if (!glyphsOnly)
+        CheckWindowMenu(existing, false, false);
     Check(WindhawkUtils::SetFunctionHook(CreateWindowExW, etm::CreateWindowExWHook,
                                          &etm::g_createWindowEx) &&
           MH_EnableHook(reinterpret_cast<void*>(CreateWindowExW)) == MH_OK,
           "future Explorer windows can receive the owner observer");
     Wh_ModAfterInit();
+    if (glyphsOnly) {
+        probeNativeSystemGlyphs = true;
+        etm::g_settings.theme = etm::SystemUsesDarkMenus() ? 1 : 2;
+        etm::g_settings.darkTint = etm::g_settings.lightTint;
+        etm::g_settings.matchMenuForeground = false;
+        CheckWindowMenu(existing, false, true);
+        Check(sampledNativeSystemGlyphs, "sampled native glyphs in the title bar menu");
+        Wh_ModBeforeUninit();
+        DestroyWindow(existing);
+        return failures ? 1 : 0;
+    }
     CheckWindowMenu(existing, false, true);
     HWND created = create();
     if (created)
@@ -2344,6 +2426,7 @@ int main(int argc, char** argv) {
     bool probeScrollMenu = argc > 1 && strcmp(argv[1], "--probe-scroll-menu") == 0;
     bool probeInfoTipFade = argc > 1 && strcmp(argv[1], "--probe-infotip-fade") == 0;
     probeShellText = argc > 1 && strcmp(argv[1], "--probe-shell-text") == 0;
+    bool probeSystemGlyphs = argc > 1 && strcmp(argv[1], "--probe-system-glyphs") == 0;
     highlightGeometryOnly = probeHighlight;
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     previewMode = preview;
@@ -2395,8 +2478,8 @@ int main(int argc, char** argv) {
         printf("Failures: %d\n", failures);
         return failures ? 1 : 0;
     }
-    if (probeWindowMenu) {
-        int result = RunWindowMenuProbe();
+    if (probeWindowMenu || probeSystemGlyphs) {
+        int result = RunWindowMenuProbe(probeSystemGlyphs);
         MH_DisableHook(MH_ALL_HOOKS);
         Wh_ModUninit();
         MH_Uninitialize();

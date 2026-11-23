@@ -77,11 +77,12 @@ Tint opacity changes the material, not text or icons. Theme selection controls
 the light or dark palette.
 
 **Match text and symbols to menu theme** is on by default. When **Menu theme**
-is explicitly set to Light or Dark, text, submenu arrows, checkmarks, and
-radio dots use that palette even if another customization mixes light and
-dark foreground colors. This includes Shell-drawn captions on the desktop
-context menu. **Follow Windows** or turning this option off keeps native
-foreground colors. Menu item icons are not recolored.
+is explicitly set to Light or Dark, menu text and symbols (including title bar
+system command glyphs) use that palette even if another customization mixes
+light and dark foreground colors. This includes Shell-drawn captions on the
+desktop context menu, with distinct colors for disabled commands.
+**Follow Windows** or turning this option off keeps native foreground colors.
+Menu item icons are not recolored.
 
 ## Hover highlight
 
@@ -198,7 +199,7 @@ To continue using those mods in other applications while avoiding their Explorer
 exclude `explorer.exe` from their targets.
 
 This mod leaves Explorer's main window backdrop untouched and can complement ExplorerBlurMica.
-If the selected menu theme is opposite to the system color theme, and explorerblurmica is used, then a mismatch between menu symbols (arrows, dots) and text may be observed in the explorer main window.
+If the selected menu theme is opposite to the system color theme, and ExplorerBlurMica is used, then a mismatch between menu symbols (arrows, dots) and text may be observed in the explorer main window.
 
 Compatible with WinUI Context Menu Animation (disable Fade-in and enable
 Translucent Windows compatibility mode).
@@ -266,7 +267,7 @@ This implementation is distributed under GPL-3.0-or-later.
       - dark: Dark
     - matchMenuForeground: true
       $name: Match text and symbols to menu theme
-      $description: Use the selected Light or Dark palette for menu text, submenu arrows, checkmarks, and radio dots. Follow Windows keeps native colors. Menu icons are unchanged.
+      $description: Use the selected Light or Dark palette for menu text and system symbols, including title bar menu glyphs. Follow Windows keeps native colors. Menu item icons are unchanged.
     - tintOpacity: 35
       $name: Tint opacity
       $description: 0-100. Applies to Acrylic and Transparent.
@@ -335,6 +336,7 @@ This implementation is distributed under GPL-3.0-or-later.
 #include <atomic>
 #include <cmath>
 #include <cwchar>
+#include <memory>
 #include <new>
 
 #include <windhawk_utils.h>
@@ -2117,8 +2119,38 @@ LRESULT CALLBACK MenuPopupSubclass(HWND hwnd,
 
 struct ShellTextPaint {
     HDC target = nullptr;
-    HDC compatibleDCs[4]{};
+    HDC inlineDCs[4];
+    std::unique_ptr<HDC[]> extraDCs;
+    size_t dcCount = 0;
+    size_t dcCapacity = ARRAYSIZE(inlineDCs);
     bool dark = false;
+
+    HDC* DCs() { return extraDCs ? extraDCs.get() : inlineDCs; }
+
+    size_t FindDC(HDC dc) {
+        const HDC* dcs = DCs();
+        for (size_t i = 0; i < dcCount; ++i) {
+            if (dcs[i] == dc)
+                return i;
+        }
+        return dcCount;
+    }
+
+    void AddDC(HDC dc) {
+        if (dcCount == dcCapacity) {
+            SelectionReplayErrorGuard errorGuard;
+            const size_t capacity = dcCapacity * 2;
+            std::unique_ptr<HDC[]> grown(new (std::nothrow) HDC[capacity]);
+            if (!grown)
+                return;
+            const HDC* dcs = DCs();
+            for (size_t i = 0; i < dcCount; ++i)
+                grown[i] = dcs[i];
+            extraDCs.swap(grown);
+            dcCapacity = capacity;
+        }
+        DCs()[dcCount++] = dc;
+    }
 };
 thread_local ShellTextPaint* t_shellTextPaint = nullptr;
 
@@ -2131,6 +2163,7 @@ LRESULT CALLBACK MenuOwnerSubclass(HWND hwnd,
     auto scope = reinterpret_cast<MenuScope*>(data);
     if (scope != t_scope || !scope->allowed)
         return DefSubclassProc(hwnd, message, wParam, lParam);
+    ShellTextPaint textPaint;
     struct DrawingContext {
         MenuScope* scope;
         HWND oldWindow;
@@ -2142,7 +2175,6 @@ LRESULT CALLBACK MenuOwnerSubclass(HWND hwnd,
             t_shellTextPaint = oldTextPaint;
         }
     } context{scope, scope->paintingWindow, scope->drawingItem, t_shellTextPaint};
-    ShellTextPaint textPaint;
     t_shellTextPaint = nullptr;
     scope->paintingWindow = nullptr;
     scope->drawingItem = nullptr;
@@ -2215,41 +2247,36 @@ HDC WINAPI CreateCompatibleDCHook(HDC source) {
         g_stopping.load(std::memory_order_relaxed)) {
         [[clang::musttail]] return g_createCompatibleDC(source);
     }
-    for (HDC& dc : paint->compatibleDCs) {
-        if (!dc) {
-            CallGuard call;
-            dc = g_createCompatibleDC(source);
-            return dc;
-        }
-    }
-    [[clang::musttail]] return g_createCompatibleDC(source);
+    CallGuard call;
+    HDC dc = g_createCompatibleDC(source);
+    if (dc)
+        paint->AddDC(dc);
+    return dc;
 }
 
 BOOL WINAPI DeleteDCHook(HDC dc) {
-    if (auto* paint = t_shellTextPaint) {
-        for (HDC& known : paint->compatibleDCs) {
-            if (known && known == dc) {
-                CallGuard call;
-                BOOL deleted = g_deleteDC(dc);
-                if (deleted)
-                    known = nullptr;
-                return deleted;
+    if (auto* paint = t_shellTextPaint; paint && dc) {
+        const size_t index = paint->FindDC(dc);
+        if (index != paint->dcCount) {
+            CallGuard call;
+            BOOL deleted = g_deleteDC(dc);
+            if (deleted) {
+                --paint->dcCount;
+                if (index != paint->dcCount)
+                    paint->DCs()[index] = paint->DCs()[paint->dcCount];
             }
+            return deleted;
         }
     }
     [[clang::musttail]] return g_deleteDC(dc);
 }
 
 const ShellTextPaint* ShellTextPaintForDC(HDC dc) {
-    const auto* paint = t_shellTextPaint;
-    if (paint && dc && !t_textDepth &&
-        !g_stopping.load(std::memory_order_relaxed)) {
-        for (HDC known : paint->compatibleDCs) {
-            if (known == dc)
-                return paint;
-        }
-    }
-    return nullptr;
+    auto* paint = t_shellTextPaint;
+    return paint && dc && !t_textDepth &&
+                   !g_stopping.load(std::memory_order_relaxed) &&
+                   paint->FindDC(dc) != paint->dcCount
+               ? paint : nullptr;
 }
 
 bool IsMenuTheme(HTHEME theme) {
@@ -2529,6 +2556,8 @@ COLORREF MenuTextColor(bool dark, bool disabled) {
 }
 
 void SetMenuTextColor(DTTOPTS& options, bool dark, int state) {
+    if (options.dwFlags & DTT_STATEID)
+        state = options.iStateId;
     options.dwFlags |= DTT_TEXTCOLOR;
     options.crText = MenuTextColor(dark, state == MPI_DISABLED || state == MPI_DISABLEDHOT);
 }
@@ -2540,7 +2569,8 @@ HTHEME MenuBackgroundTheme(HTHEME theme, HDC dc, int part) {
     if (!popup)
         return theme;
     if (part == MENU_POPUPCHECK || part == MENU_POPUPCHECKBACKGROUND ||
-        part == MENU_POPUPSUBMENU)
+        part == MENU_POPUPSUBMENU ||
+        (part >= MENU_SYSTEMCLOSE && part <= MENU_SYSTEMRESTORE))
         return g_settings.MatchMenuForeground() ? popup->palette : theme;
     return popup->palette;
 }
